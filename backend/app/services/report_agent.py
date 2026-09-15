@@ -19,6 +19,7 @@ from datetime import datetime
 from enum import Enum
 
 from ..config import Config
+from ..utils.json_files import read_json, write_json_atomic
 from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
@@ -1017,7 +1018,8 @@ class ReportAgent:
                 max_agents = parameters.get("max_agents", 5)
                 if isinstance(max_agents, str):
                     max_agents = int(max_agents)
-                max_agents = min(max_agents, 10)
+                # 同时限制上下界：负值会让切片变成"取最后N个之外的全部"
+                max_agents = max(1, min(max_agents, 10))
                 result = self.zep_tools.interview_agents(
                     simulation_id=self.simulation_id,
                     interview_requirement=interview_topic,
@@ -1085,9 +1087,17 @@ class ReportAgent:
         for match in re.finditer(xml_pattern, response, re.DOTALL):
             try:
                 call_data = json.loads(match.group(1))
-                tool_calls.append(call_data)
             except json.JSONDecodeError:
-                pass
+                continue
+            # 与裸 JSON 兜底路径保持一致：只接受合法工具调用，
+            # 否则后续 call['name'] 会抛 KeyError/TypeError 并使整个报告失败
+            if isinstance(call_data, dict) and self._is_valid_tool_call(call_data):
+                tool_calls.append(call_data)
+            else:
+                logger.warning(
+                    "忽略无法识别的 <tool_call> 内容: %s",
+                    str(match.group(1))[:200],
+                )
 
         if tool_calls:
             return tool_calls
@@ -1949,6 +1959,16 @@ class ReportManager:
     # 报告存储目录
     REPORTS_DIR = os.path.join(Config.UPLOAD_FOLDER, 'reports')
     
+    # 报告ID只允许生成的 report_<hex> 形式，避免外部传入的ID逃逸出报告目录
+    _REPORT_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
+    
+    @classmethod
+    def is_valid_report_id(cls, report_id: str) -> bool:
+        """判断报告ID是否为安全的单层目录名"""
+        return isinstance(report_id, str) and bool(
+            cls._REPORT_ID_PATTERN.fullmatch(report_id)
+        )
+    
     @classmethod
     def _ensure_reports_dir(cls):
         """确保报告根目录存在"""
@@ -1956,7 +1976,13 @@ class ReportManager:
     
     @classmethod
     def _get_report_folder(cls, report_id: str) -> str:
-        """获取报告文件夹路径"""
+        """获取报告文件夹路径
+        
+        Raises:
+            ValueError: report_id 不是安全的单层目录名
+        """
+        if not cls.is_valid_report_id(report_id):
+            raise ValueError(f"非法的报告ID: {report_id!r}")
         return os.path.join(cls.REPORTS_DIR, report_id)
     
     @classmethod
@@ -2021,6 +2047,14 @@ class ReportManager:
                 "has_more": 是否还有更多日志
             }
         """
+        if not cls.is_valid_report_id(report_id):
+            return {
+                "logs": [],
+                "total_lines": 0,
+                "from_line": 0,
+                "has_more": False
+            }
+        
         log_path = cls._get_console_log_path(report_id)
         
         if not os.path.exists(log_path):
@@ -2079,6 +2113,14 @@ class ReportManager:
                 "has_more": 是否还有更多日志
             }
         """
+        if not cls.is_valid_report_id(report_id):
+            return {
+                "logs": [],
+                "total_lines": 0,
+                "from_line": 0,
+                "has_more": False
+            }
+        
         log_path = cls._get_agent_log_path(report_id)
         
         if not os.path.exists(log_path):
@@ -2133,8 +2175,7 @@ class ReportManager:
         """
         cls._ensure_report_folder(report_id)
         
-        with open(cls._get_outline_path(report_id), 'w', encoding='utf-8') as f:
-            json.dump(outline.to_dict(), f, ensure_ascii=False, indent=2)
+        write_json_atomic(cls._get_outline_path(report_id), outline.to_dict())
         
         logger.info(t('report.outlineSaved', reportId=report_id))
     
@@ -2269,19 +2310,20 @@ class ReportManager:
             "updated_at": datetime.now().isoformat()
         }
         
-        with open(cls._get_progress_path(report_id), 'w', encoding='utf-8') as f:
-            json.dump(progress_data, f, ensure_ascii=False, indent=2)
+        write_json_atomic(cls._get_progress_path(report_id), progress_data)
     
     @classmethod
     def get_progress(cls, report_id: str) -> Optional[Dict[str, Any]]:
         """获取报告生成进度"""
+        if not cls.is_valid_report_id(report_id):
+            return None
+        
         path = cls._get_progress_path(report_id)
         
         if not os.path.exists(path):
             return None
         
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        return read_json(path)
     
     @classmethod
     def get_generated_sections(cls, report_id: str) -> List[Dict[str, Any]]:
@@ -2290,6 +2332,9 @@ class ReportManager:
         
         返回所有已保存的章节文件信息
         """
+        if not cls.is_valid_report_id(report_id):
+            return []
+        
         folder = cls._get_report_folder(report_id)
         
         if not os.path.exists(folder):
@@ -2476,8 +2521,7 @@ class ReportManager:
         cls._ensure_report_folder(report.report_id)
         
         # 保存元信息JSON
-        with open(cls._get_report_path(report.report_id), 'w', encoding='utf-8') as f:
-            json.dump(report.to_dict(), f, ensure_ascii=False, indent=2)
+        write_json_atomic(cls._get_report_path(report.report_id), report.to_dict())
         
         # 保存大纲
         if report.outline:
@@ -2493,6 +2537,9 @@ class ReportManager:
     @classmethod
     def get_report(cls, report_id: str) -> Optional[Report]:
         """获取报告"""
+        if not cls.is_valid_report_id(report_id):
+            return None
+        
         path = cls._get_report_path(report_id)
         
         if not os.path.exists(path):
@@ -2503,8 +2550,7 @@ class ReportManager:
             else:
                 return None
         
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        data = read_json(path)
         
         # 重建Report对象
         outline = None
@@ -2523,7 +2569,7 @@ class ReportManager:
             )
         
         # 如果markdown_content为空，尝试从full_report.md读取
-        markdown_content = data.get('markdown_content', '')
+        markdown_content = data.get('markdown_content') or ''
         if not markdown_content:
             full_report_path = cls._get_report_markdown_path(report_id)
             if os.path.exists(full_report_path):
@@ -2545,24 +2591,22 @@ class ReportManager:
     
     @classmethod
     def get_report_by_simulation(cls, simulation_id: str) -> Optional[Report]:
-        """根据模拟ID获取报告"""
+        """根据模拟ID获取最新的一份报告
+
+        同一模拟可能有多份报告（每次 /generate 都会新建目录，
+        force_regenerate 也保留旧报告），因此必须按创建时间取最新的一份，
+        不能依赖 os.listdir 的目录顺序。
+        """
         cls._ensure_reports_dir()
         
-        for item in os.listdir(cls.REPORTS_DIR):
-            item_path = os.path.join(cls.REPORTS_DIR, item)
-            # 新格式：文件夹
-            if os.path.isdir(item_path):
-                report = cls.get_report(item)
-                if report and report.simulation_id == simulation_id:
-                    return report
-            # 兼容旧格式：JSON文件
-            elif item.endswith('.json'):
-                report_id = item[:-5]
-                report = cls.get_report(report_id)
-                if report and report.simulation_id == simulation_id:
-                    return report
+        matches = [
+            report
+            for report in cls.list_reports(simulation_id=simulation_id, limit=None)
+        ]
+        if not matches:
+            return None
         
-        return None
+        return max(matches, key=lambda report: report.created_at)
     
     @classmethod
     def list_reports(cls, simulation_id: Optional[str] = None, limit: int = 50) -> List[Report]:
@@ -2595,6 +2639,10 @@ class ReportManager:
     def delete_report(cls, report_id: str) -> bool:
         """删除报告（整个文件夹）"""
         import shutil
+        
+        if not cls.is_valid_report_id(report_id):
+            logger.warning(f"拒绝删除非法报告ID: {report_id!r}")
+            return False
         
         folder_path = cls._get_report_folder(report_id)
         

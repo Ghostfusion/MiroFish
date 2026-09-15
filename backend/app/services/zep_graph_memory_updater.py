@@ -400,7 +400,7 @@ class ZepGraphMemoryUpdater:
             agent_id=data.get("agent_id", 0),
             agent_name=data.get("agent_name", ""),
             action_type=data.get("action_type", ""),
-            action_args=data.get("action_args", {}),
+            action_args=data.get("action_args") or {},
             round_num=data.get("round", 0),
             timestamp=data.get("timestamp", datetime.now().isoformat()),
         )
@@ -487,7 +487,21 @@ class ZepGraphMemoryUpdater:
             return 0
 
         processed_count = 0
-        for payload_activities, combined_text in self._build_episode_payloads(activities):
+        try:
+            payloads = self._build_episode_payloads(activities)
+        except Exception as e:
+            # 负载构建失败也要记账：批次已经从句柄缓冲区中取出，
+            # 静默丢弃会让 stop() 的完整性检查误判为成功
+            logger.error(f"构建图谱事件负载失败，整批活动计为失败: {e}")
+            self._failed_count += 1
+            self._failed_batches.append({
+                "platform": platform,
+                "activities": list(activities),
+                "error": str(e),
+            })
+            return 0
+
+        for payload_activities, combined_text in payloads:
             if deadline is not None and time.time() >= deadline:
                 raise _DrainDeadlineExceeded(processed_count)
             try:
@@ -785,7 +799,9 @@ class ZepGraphMemoryManager:
     @classmethod
     def get_all_stats(cls) -> Dict[str, Dict[str, Any]]:
         """获取所有更新器的统计信息"""
+        with cls._lock:
+            updaters = list(cls._updaters.items())
         return {
-            sim_id: updater.get_stats() 
-            for sim_id, updater in cls._updaters.items()
+            sim_id: updater.get_stats()
+            for sim_id, updater in updaters
         }

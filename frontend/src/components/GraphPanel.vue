@@ -752,17 +752,26 @@ const renderGraph = () => {
     })
     
     // 更新边标签背景
-    linkLabelBg.each(function(d, i) {
-      const mid = getLinkMidpoint(d)
-      const textEl = linkLabels.nodes()[i]
-      const bbox = textEl.getBBox()
-      d3.select(this)
-        .attr('x', mid.x - bbox.width / 2 - 4)
-        .attr('y', mid.y - bbox.height / 2 - 2)
-        .attr('width', bbox.width + 8)
-        .attr('height', bbox.height + 4)
-        .attr('transform', '') // 移除旋转
-    })
+    if (showEdgeLabels.value) {
+      linkLabelBg.each(function(d, i) {
+        const textEl = linkLabels.nodes()[i]
+        if (!textEl) return
+        let bbox
+        try {
+          bbox = textEl.getBBox()
+        } catch (e) {
+          // 元素未渲染（如 display:none）时 getBBox 会抛错，跳过避免中断 tick
+          return
+        }
+        const mid = getLinkMidpoint(d)
+        d3.select(this)
+          .attr('x', mid.x - bbox.width / 2 - 4)
+          .attr('y', mid.y - bbox.height / 2 - 2)
+          .attr('width', bbox.width + 8)
+          .attr('height', bbox.height + 4)
+          .attr('transform', '') // 移除旋转
+      })
+    }
 
     node
       .attr('cx', d => d.x)

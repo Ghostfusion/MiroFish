@@ -235,3 +235,43 @@ def test_flush_deadline_keeps_unattempted_platform_for_a_safe_retry(monkeypatch)
     updater._flush_remaining(deadline=1.0)
     assert updater._platform_buffers["reddit"] == []
     assert len(writes) == 2
+
+
+def test_payload_build_failure_is_recorded_as_a_failed_batch(monkeypatch):
+    updater = _updater(monkeypatch, lambda **_kwargs: SimpleNamespace(uuid_="episode-1"))
+
+    def boom(_activities):
+        raise AttributeError("'NoneType' object has no attribute 'get'")
+
+    monkeypatch.setattr(updater, "_build_episode_payloads", boom)
+
+    processed = updater._send_batch_activities([_activity(1), _activity(2)], "twitter")
+
+    assert processed == 0
+    assert updater._failed_count == 1
+    assert len(updater._failed_batches) == 1
+    assert len(updater._failed_batches[0]["activities"]) == 2
+
+
+def test_add_activity_from_dict_tolerates_null_action_args(monkeypatch):
+    writes = []
+    updater = _updater(
+        monkeypatch,
+        lambda **kwargs: writes.append(kwargs) or SimpleNamespace(uuid_="episode-1"),
+    )
+    updater._running = True
+
+    updater.add_activity_from_dict(
+        {
+            "round": 1,
+            "agent_id": 0,
+            "agent_name": "Alice",
+            "action_type": "CREATE_POST",
+            "action_args": None,
+        },
+        "twitter",
+    )
+    updater._flush_remaining()
+
+    assert len(writes) == 1
+    assert "Alice" in writes[0]["data"]

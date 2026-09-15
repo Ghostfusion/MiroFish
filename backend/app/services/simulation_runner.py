@@ -19,6 +19,7 @@ from enum import Enum
 from queue import Queue
 
 from ..config import Config
+from ..utils.json_files import read_json, write_json_atomic
 from ..utils.logger import get_logger
 from ..utils.locale import get_locale, set_locale
 from ..utils.zep import (
@@ -305,8 +306,7 @@ class SimulationRunner:
             return None
         
         try:
-            with open(state_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            data = read_json(state_file)
             
             state = SimulationRunState(
                 simulation_id=simulation_id,
@@ -343,7 +343,7 @@ class SimulationRunner:
                     agent_id=a.get("agent_id", 0),
                     agent_name=a.get("agent_name", ""),
                     action_type=a.get("action_type", ""),
-                    action_args=a.get("action_args", {}),
+                    action_args=a.get("action_args") or {},
                     result=a.get("result"),
                     success=a.get("success", True),
                 ))
@@ -362,8 +362,7 @@ class SimulationRunner:
         
         data = state.to_detail_dict()
         
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        write_json_atomic(state_file, data)
         
         cls._run_states[state.simulation_id] = state
     
@@ -632,8 +631,10 @@ class SimulationRunner:
         if not process or not state:
             return
         
-        twitter_position = 0
-        reddit_position = 0
+        # 从当前文件末尾开始读取：重启模拟时子进程会继续向同一个 actions.jsonl
+        # 追加（不会截断），从头读取会把上一次运行的动作重复计入并重复写入图谱
+        twitter_position = cls._current_log_size(twitter_actions_log)
+        reddit_position = cls._current_log_size(reddit_actions_log)
         
         monitor_error: Exception | None = None
         exit_code: int | None = None
@@ -763,6 +764,14 @@ class SimulationRunner:
                     pass
                 cls._stderr_files.pop(simulation_id, None)
     
+    @staticmethod
+    def _current_log_size(log_path: str) -> int:
+        """返回日志文件当前大小（不存在时为0），用于跳过历史记录"""
+        try:
+            return os.path.getsize(log_path)
+        except OSError:
+            return 0
+    
     @classmethod
     def _read_action_log(
         cls, 
@@ -790,13 +799,23 @@ class SimulationRunner:
             graph_updater = ZepGraphMemoryManager.get_updater(state.simulation_id)
         
         try:
-            with open(log_path, 'r', encoding='utf-8') as f:
+            # 以二进制模式读取：文本模式下迭代中调用 tell() 会抛
+            # "telling position disabled by next() call"，而这里必须精确的字节偏移
+            with open(log_path, 'rb') as f:
                 f.seek(position)
-                for line in f:
-                    line = line.strip()
+                consumed = position
+                for raw_line in f:
+                    # 只消费完整行：写入方逐行 append，文件末尾可能是写到一半的记录，
+                    # 把它算作已读会让该条记录永久丢失
+                    if not raw_line.endswith(b'\n'):
+                        break
+                    consumed = f.tell()
+                    line = raw_line.decode('utf-8', errors='replace').strip()
                     if line:
                         try:
                             action_data = json.loads(line)
+                            if not isinstance(action_data, dict):
+                                raise ValueError("动作日志条目不是 JSON 对象")
                             
                             # 处理事件类型的条目
                             if "event_type" in action_data:
@@ -827,26 +846,34 @@ class SimulationRunner:
                                             f"{state.simulation_id}"
                                         )
                                 
+                                # 模拟时间只在 round_start 事件中携带（simulated_hour）
+                                elif event_type == "round_start":
+                                    simulated_hour = action_data.get("simulated_hour", 0)
+                                    if platform == "twitter":
+                                        state.twitter_simulated_hours = simulated_hour
+                                    elif platform == "reddit":
+                                        state.reddit_simulated_hours = simulated_hour
+                                    # 总体时间取两个平台的最大值
+                                    state.simulated_hours = max(
+                                        state.twitter_simulated_hours,
+                                        state.reddit_simulated_hours,
+                                    )
+                                
                                 # 更新轮次信息（从 round_end 事件）
                                 elif event_type == "round_end":
                                     round_num = action_data.get("round", 0)
-                                    simulated_hours = action_data.get("simulated_hours", 0)
                                     
-                                    # 更新各平台独立的轮次和时间
+                                    # 更新各平台独立的轮次
                                     if platform == "twitter":
                                         if round_num > state.twitter_current_round:
                                             state.twitter_current_round = round_num
-                                        state.twitter_simulated_hours = simulated_hours
                                     elif platform == "reddit":
                                         if round_num > state.reddit_current_round:
                                             state.reddit_current_round = round_num
-                                        state.reddit_simulated_hours = simulated_hours
                                     
                                     # 总体轮次取两个平台的最大值
                                     if round_num > state.current_round:
                                         state.current_round = round_num
-                                    # 总体时间取两个平台的最大值
-                                    state.simulated_hours = max(state.twitter_simulated_hours, state.reddit_simulated_hours)
                                 
                                 continue
                             
@@ -857,7 +884,7 @@ class SimulationRunner:
                                 agent_id=action_data.get("agent_id", 0),
                                 agent_name=action_data.get("agent_name", ""),
                                 action_type=action_data.get("action_type", ""),
-                                action_args=action_data.get("action_args", {}),
+                                action_args=action_data.get("action_args") or {},
                                 result=action_data.get("result"),
                                 success=action_data.get("success", True),
                             )
@@ -871,9 +898,13 @@ class SimulationRunner:
                             if graph_updater:
                                 graph_updater.add_activity_from_dict(action_data, platform)
                             
-                        except json.JSONDecodeError:
-                            pass
-                return f.tell()
+                        except Exception as e:
+                            # 单行异常（非法JSON、字段类型异常、图谱更新失败）只跳过这一行。
+                            # 绝不能回退读取位置：动作写入图谱没有幂等键，重放会重复写入
+                            logger.warning(
+                                f"跳过无法处理的动作日志行: {log_path}, error={e}"
+                            )
+                return consumed
         except Exception as e:
             logger.warning(f"读取动作日志失败: {log_path}, error={e}")
             return position

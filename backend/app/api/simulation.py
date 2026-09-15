@@ -4,7 +4,6 @@ Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化�
 """
 
 import os
-import traceback
 from contextlib import nullcontext
 from flask import request, jsonify, send_file
 
@@ -12,13 +11,18 @@ from . import simulation_bp
 from ..config import Config
 from ..services.zep_entity_reader import ZepEntityReader
 from ..services.oasis_profile_generator import OasisProfileGenerator
-from ..services.simulation_manager import SimulationManager, SimulationStatus
+from ..services.simulation_manager import (
+    SimulationManager,
+    SimulationStatus,
+    is_valid_simulation_id,
+)
 from ..services.simulation_runner import (
     SimulationRunner,
     RunnerStatus,
     SimulationStopPending,
 )
 from ..services.zep_graph_memory_updater import ZepGraphMemoryManager
+from ..utils.json_files import read_json, write_json_atomic
 from ..utils.logger import get_logger
 from ..utils.locale import t, get_locale, set_locale
 from ..utils.zep_lifecycle import get_graph_readers, graph_lifecycle_lock
@@ -48,6 +52,33 @@ def _get_default_platform(simulation_id: str) -> str:
     except Exception:
         pass
     return "reddit"
+
+
+def _resolve_platform(simulation_id: str, platform: str | None) -> str:
+    """
+    解析并校验平台参数
+
+    平台名会参与数据库文件名的拼接，因此必须是白名单内的值，
+    否则请求参数可以逃逸出模拟目录。
+
+    Raises:
+        ValueError: 平台不是 twitter/reddit
+    """
+    resolved = platform or _get_default_platform(simulation_id)
+    if resolved not in ('twitter', 'reddit'):
+        raise ValueError(f"不支持的平台: {resolved}")
+    return resolved
+
+
+@simulation_bp.before_request
+def _reject_invalid_simulation_id():
+    """模拟ID会参与文件路径拼接，非法ID直接拒绝（防止目录逃逸）"""
+    simulation_id = (request.view_args or {}).get('simulation_id')
+    if simulation_id is not None and not is_valid_simulation_id(simulation_id):
+        return jsonify({
+            "success": False,
+            "error": t('api.simulationNotFound', id=simulation_id)
+        }), 404
 
 
 # Interview prompt 优化前缀
@@ -116,7 +147,6 @@ def get_graph_entities(graph_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -149,7 +179,6 @@ def get_entity_detail(graph_id: str, entity_uuid: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -186,7 +215,6 @@ def get_entities_by_type(graph_id: str, entity_type: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -222,7 +250,7 @@ def create_simulation():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         project_id = data.get('project_id')
         if not project_id:
@@ -263,7 +291,6 @@ def create_simulation():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -272,8 +299,9 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
     检查模拟是否已经准备完成
     
     检查条件：
-    1. state.json 存在且 status 为 "ready"
-    2. 必要文件存在：reddit_profiles.json, twitter_profiles.csv, simulation_config.json
+    1. state.json/config_generated 表示准备工作已完成
+    2. 必要文件存在：simulation_config.json，以及已启用平台对应的
+       Profile 文件（reddit_profiles.json / twitter_profiles.csv）
     
     注意：运行脚本(run_*.py)保留在 backend/scripts/ 目录，不再复制到模拟目录
     
@@ -286,19 +314,36 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
     import os
     from ..config import Config
     
+    if not is_valid_simulation_id(simulation_id):
+        return False, {"reason": f"非法的模拟ID: {simulation_id!r}"}
+    
     simulation_dir = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
     
     # 检查目录是否存在
     if not os.path.exists(simulation_dir):
         return False, {"reason": "模拟目录不存在"}
     
+    import json
+    
+    state_file = os.path.join(simulation_dir, "state.json")
+    state_data: dict = {}
+    if os.path.exists(state_file):
+        try:
+            state_data = read_json(state_file)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"读取模拟状态失败: simulation_id={simulation_id}, error={e}")
+            state_data = {}
+    
     # 必要文件列表（不包括脚本，脚本位于 backend/scripts/）
-    required_files = [
-        "state.json",
-        "simulation_config.json",
-        "reddit_profiles.json",
-        "twitter_profiles.csv"
-    ]
+    # Profile 文件只需覆盖已启用的平台：单平台模拟不会生成另一个平台的文件
+    required_files = ["state.json", "simulation_config.json"]
+    if state_data.get("enable_reddit", True):
+        required_files.append("reddit_profiles.json")
+    if state_data.get("enable_twitter", True):
+        required_files.append("twitter_profiles.csv")
+    if len(required_files) == 2:
+        # 两个平台都未启用，退回旧行为
+        required_files.extend(["reddit_profiles.json", "twitter_profiles.csv"])
     
     # 检查文件是否存在
     existing_files = []
@@ -317,13 +362,8 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
             "existing_files": existing_files
         }
     
-    # 检查state.json中的状态
-    state_file = os.path.join(simulation_dir, "state.json")
+    # 检查state.json中的状态（内容已在上方读取）
     try:
-        import json
-        with open(state_file, 'r', encoding='utf-8') as f:
-            state_data = json.load(f)
-        
         status = state_data.get("status", "")
         config_generated = state_data.get("config_generated", False)
         
@@ -340,15 +380,19 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         # - failed: 运行失败（但准备是完成的）
         prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed"]
         if status in prepared_statuses and config_generated:
-            # 获取文件统计信息
-            profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")
-            config_file = os.path.join(simulation_dir, "simulation_config.json")
-            
+            # 获取文件统计信息（单平台模拟只有对应平台的文件）
             profiles_count = 0
-            if os.path.exists(profiles_file):
-                with open(profiles_file, 'r', encoding='utf-8') as f:
+            reddit_profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")
+            twitter_profiles_file = os.path.join(simulation_dir, "twitter_profiles.csv")
+            if os.path.exists(reddit_profiles_file):
+                with open(reddit_profiles_file, 'r', encoding='utf-8') as f:
                     profiles_data = json.load(f)
-                    profiles_count = len(profiles_data) if isinstance(profiles_data, list) else 0
+                if isinstance(profiles_data, list):
+                    profiles_count = len(profiles_data)
+            elif os.path.exists(twitter_profiles_file):
+                import csv
+                with open(twitter_profiles_file, 'r', encoding='utf-8', newline='') as f:
+                    profiles_count = sum(1 for _ in csv.DictReader(f))
             
             # 如果状态是preparing但文件已完成，自动更新状态为ready
             if status == "preparing":
@@ -356,8 +400,7 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
                     state_data["status"] = "ready"
                     from datetime import datetime
                     state_data["updated_at"] = datetime.now().isoformat()
-                    with open(state_file, 'w', encoding='utf-8') as f:
-                        json.dump(state_data, f, ensure_ascii=False, indent=2)
+                    write_json_atomic(state_file, state_data)
                     logger.info(f"自动更新模拟状态: {simulation_id} preparing -> ready")
                     status = "ready"
                 except Exception as e:
@@ -433,7 +476,7 @@ def prepare_simulation():
     from ..config import Config
     
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         simulation_id = data.get('simulation_id')
         if not simulation_id:
@@ -670,7 +713,6 @@ def prepare_simulation():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -705,7 +747,7 @@ def get_prepare_status():
     from ..models.task import TaskManager
     
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         task_id = data.get('task_id')
         simulation_id = data.get('simulation_id')
@@ -816,7 +858,6 @@ def get_simulation(simulation_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -845,7 +886,6 @@ def list_simulations():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1018,7 +1058,6 @@ def get_simulation_history():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1031,7 +1070,7 @@ def get_simulation_profiles(simulation_id: str):
         platform: 平台类型（reddit/twitter，默认reddit）
     """
     try:
-        platform = request.args.get('platform') or _get_default_platform(simulation_id)
+        platform = _resolve_platform(simulation_id, request.args.get('platform'))
 
         manager = SimulationManager()
         profiles = manager.get_profiles(simulation_id, platform=platform)
@@ -1056,7 +1095,6 @@ def get_simulation_profiles(simulation_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1093,7 +1131,7 @@ def get_simulation_profiles_realtime(simulation_id: str):
     from datetime import datetime
     
     try:
-        platform = request.args.get('platform') or _get_default_platform(simulation_id)
+        platform = _resolve_platform(simulation_id, request.args.get('platform'))
 
         # 获取模拟目录
         sim_dir = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
@@ -1166,12 +1204,17 @@ def get_simulation_profiles_realtime(simulation_id: str):
             }
         })
         
+    except ValueError as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+        
     except Exception as e:
         logger.error(f"实时获取Profile失败: {str(e)}")
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1301,7 +1344,6 @@ def get_simulation_config_realtime(simulation_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1337,16 +1379,21 @@ def get_simulation_config(simulation_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
 @simulation_bp.route('/<simulation_id>/config/download', methods=['GET'])
 def download_simulation_config(simulation_id: str):
     """下载模拟配置文件"""
+    if not is_valid_simulation_id(simulation_id):
+        return jsonify({
+            "success": False,
+            "error": t('api.simulationNotFound', id=simulation_id)
+        }), 404
+    
     try:
         manager = SimulationManager()
-        sim_dir = manager._get_simulation_dir(simulation_id)
+        sim_dir = manager._get_simulation_dir(simulation_id, create=False)
         config_path = os.path.join(sim_dir, "simulation_config.json")
         
         if not os.path.exists(config_path):
@@ -1366,7 +1413,6 @@ def download_simulation_config(simulation_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1418,7 +1464,6 @@ def download_simulation_script(script_name: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1438,7 +1483,7 @@ def generate_profiles():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         graph_id = data.get('graph_id')
         if not graph_id:
@@ -1492,7 +1537,6 @@ def generate_profiles():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1540,7 +1584,7 @@ def start_simulation():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
 
         simulation_id = data.get('simulation_id')
         if not simulation_id:
@@ -1781,7 +1825,6 @@ def start_simulation():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1806,7 +1849,7 @@ def stop_simulation():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         simulation_id = data.get('simulation_id')
         if not simulation_id:
@@ -1856,7 +1899,6 @@ def stop_simulation():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1916,7 +1958,6 @@ def get_run_status(simulation_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -2017,7 +2058,6 @@ def get_run_status_detail(simulation_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -2071,7 +2111,6 @@ def get_simulation_actions(simulation_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -2111,7 +2150,6 @@ def get_simulation_timeline(simulation_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -2138,7 +2176,6 @@ def get_agent_stats(simulation_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -2157,7 +2194,7 @@ def get_simulation_posts(simulation_id: str):
     返回帖子列表（从SQLite数据库读取）
     """
     try:
-        platform = request.args.get('platform') or _get_default_platform(simulation_id)
+        platform = _resolve_platform(simulation_id, request.args.get('platform'))
         limit = request.args.get('limit', 50, type=int)
         offset = request.args.get('offset', 0, type=int)
 
@@ -2182,26 +2219,27 @@ def get_simulation_posts(simulation_id: str):
         
         import sqlite3
         conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
         try:
-            cursor.execute("""
-                SELECT * FROM post 
-                ORDER BY created_at DESC 
-                LIMIT ? OFFSET ?
-            """, (limit, offset))
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
             
-            posts = [dict(row) for row in cursor.fetchall()]
-            
-            cursor.execute("SELECT COUNT(*) FROM post")
-            total = cursor.fetchone()[0]
-            
-        except sqlite3.OperationalError:
-            posts = []
-            total = 0
-        
-        conn.close()
+            try:
+                cursor.execute("""
+                    SELECT * FROM post 
+                    ORDER BY created_at DESC 
+                    LIMIT ? OFFSET ?
+                """, (limit, offset))
+                
+                posts = [dict(row) for row in cursor.fetchall()]
+                
+                cursor.execute("SELECT COUNT(*) FROM post")
+                total = cursor.fetchone()[0]
+                
+            except sqlite3.OperationalError:
+                posts = []
+                total = 0
+        finally:
+            conn.close()
         
         return jsonify({
             "success": True,
@@ -2213,12 +2251,17 @@ def get_simulation_posts(simulation_id: str):
             }
         })
         
+    except ValueError as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+        
     except Exception as e:
         logger.error(f"获取帖子失败: {str(e)}")
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -2234,7 +2277,7 @@ def get_simulation_comments(simulation_id: str):
         offset: 偏移量
     """
     try:
-        platform = request.args.get('platform') or _get_default_platform(simulation_id)
+        platform = _resolve_platform(simulation_id, request.args.get('platform'))
         post_id = request.args.get('post_id')
         limit = request.args.get('limit', 50, type=int)
         offset = request.args.get('offset', 0, type=int)
@@ -2257,30 +2300,31 @@ def get_simulation_comments(simulation_id: str):
         
         import sqlite3
         conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
         try:
-            if post_id:
-                cursor.execute("""
-                    SELECT * FROM comment 
-                    WHERE post_id = ?
-                    ORDER BY created_at DESC 
-                    LIMIT ? OFFSET ?
-                """, (post_id, limit, offset))
-            else:
-                cursor.execute("""
-                    SELECT * FROM comment 
-                    ORDER BY created_at DESC 
-                    LIMIT ? OFFSET ?
-                """, (limit, offset))
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
             
-            comments = [dict(row) for row in cursor.fetchall()]
-            
-        except sqlite3.OperationalError:
-            comments = []
-        
-        conn.close()
+            try:
+                if post_id:
+                    cursor.execute("""
+                        SELECT * FROM comment 
+                        WHERE post_id = ?
+                        ORDER BY created_at DESC 
+                        LIMIT ? OFFSET ?
+                    """, (post_id, limit, offset))
+                else:
+                    cursor.execute("""
+                        SELECT * FROM comment 
+                        ORDER BY created_at DESC 
+                        LIMIT ? OFFSET ?
+                    """, (limit, offset))
+                
+                comments = [dict(row) for row in cursor.fetchall()]
+                
+            except sqlite3.OperationalError:
+                comments = []
+        finally:
+            conn.close()
         
         return jsonify({
             "success": True,
@@ -2290,12 +2334,17 @@ def get_simulation_comments(simulation_id: str):
             }
         })
         
+    except ValueError as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+        
     except Exception as e:
         logger.error(f"获取评论失败: {str(e)}")
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -2353,7 +2402,7 @@ def interview_agent():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         simulation_id = data.get('simulation_id')
         agent_id = data.get('agent_id')
@@ -2426,7 +2475,6 @@ def interview_agent():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -2475,7 +2523,7 @@ def interview_agents_batch():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
 
         simulation_id = data.get('simulation_id')
         interviews = data.get('interviews')
@@ -2564,7 +2612,6 @@ def interview_agents_batch():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -2602,7 +2649,7 @@ def interview_all_agents():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
 
         simulation_id = data.get('simulation_id')
         prompt = data.get('prompt')
@@ -2667,7 +2714,6 @@ def interview_all_agents():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -2706,7 +2752,7 @@ def get_interview_history():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         simulation_id = data.get('simulation_id')
         platform = data.get('platform')  # 不指定则返回两个平台的历史
@@ -2739,7 +2785,6 @@ def get_interview_history():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -2768,7 +2813,7 @@ def get_env_status():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         simulation_id = data.get('simulation_id')
         
@@ -2804,7 +2849,6 @@ def get_env_status():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -2835,7 +2879,7 @@ def close_simulation_env():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         simulation_id = data.get('simulation_id')
         timeout = data.get('timeout', 30)
@@ -2851,12 +2895,18 @@ def close_simulation_env():
             timeout=timeout
         )
         
-        # 更新模拟状态
-        manager = SimulationManager()
-        state = manager.get_simulation(simulation_id)
-        if state:
-            state.status = SimulationStatus.COMPLETED
-            manager._save_simulation_state(state)
+        # 只有环境确实关闭成功时才标记为已完成，避免失败被持久化为“已结束”
+        if result.get("success"):
+            manager = SimulationManager()
+            state = manager.get_simulation(simulation_id)
+            if state:
+                state.status = SimulationStatus.COMPLETED
+                manager._save_simulation_state(state)
+        else:
+            logger.warning(
+                f"关闭模拟环境未成功，保持原状态: simulation_id={simulation_id}, "
+                f"message={result.get('message')}"
+            )
         
         return jsonify({
             "success": result.get("success", False),
@@ -2874,5 +2924,4 @@ def close_simulation_env():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500

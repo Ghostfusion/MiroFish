@@ -173,7 +173,15 @@ def split_text_into_chunks(
         
     Returns:
         文本块列表
+        
+    Raises:
+        ValueError: chunk_size/overlap 不满足 0 <= overlap < chunk_size
     """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+    if overlap < 0 or overlap >= chunk_size:
+        raise ValueError("overlap must satisfy 0 <= overlap < chunk_size")
+    
     if len(text) <= chunk_size:
         return [text] if text.strip() else []
     
@@ -185,10 +193,16 @@ def split_text_into_chunks(
         
         # 尝试在句子边界处分割
         if end < len(text):
-            # 查找最近的句子结束符
+            # 查找最近的句子结束符。只有切点在重叠窗口之外时才接受，
+            # 否则下一个块的起点不会前进（overlap >= 0.3 * chunk_size 时
+            # 会出现死循环）。
             for sep in ['。', '！', '？', '.\n', '!\n', '?\n', '\n\n', '. ', '! ', '? ']:
                 last_sep = text[start:end].rfind(sep)
-                if last_sep != -1 and last_sep > chunk_size * 0.3:
+                if (
+                    last_sep != -1
+                    and last_sep > chunk_size * 0.3
+                    and last_sep + len(sep) > overlap
+                ):
                     end = start + last_sep + len(sep)
                     break
         
@@ -196,7 +210,7 @@ def split_text_into_chunks(
         if chunk:
             chunks.append(chunk)
         
-        # 下一个块从重叠位置开始
+        # 下一个块从重叠位置开始（上面的切点约束保证严格前进）
         start = end - overlap if end < len(text) else len(text)
     
     return chunks

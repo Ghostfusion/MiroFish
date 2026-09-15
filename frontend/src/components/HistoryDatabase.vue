@@ -211,6 +211,21 @@ let observer = null
 let isAnimating = false  // 动画锁，防止闪烁
 let expandDebounceTimer = null  // 防抖定时器
 let pendingState = null  // 记录待执行的目标状态
+let isDestroyed = false  // 组件已卸载标记，防止异步回调继续修改状态
+const pendingTimers = new Set()  // 记录所有待清理的定时器句柄
+
+// 记录定时器句柄，统一在卸载时清理
+const trackTimer = (id) => {
+  pendingTimers.add(id)
+  return id
+}
+
+// 清理全部定时器
+const clearAllTimers = () => {
+  pendingTimers.forEach((id) => clearTimeout(id))
+  pendingTimers.clear()
+  expandDebounceTimer = null
+}
 
 // 卡片布局配置 - 调整为更宽的比例
 const CARDS_PER_ROW = 4
@@ -467,6 +482,7 @@ const initObserver = () => {
   observer = new IntersectionObserver(
     (entries) => {
       entries.forEach((entry) => {
+        if (isDestroyed) return
         const shouldExpand = entry.isIntersecting
         
         // 更新待执行的目标状态（无论是否在动画中都要记录最新的目标状态）
@@ -491,9 +507,9 @@ const initObserver = () => {
         // 展开时延迟较短(50ms)，收起时延迟较长(200ms)以增加稳定性
         const delay = shouldExpand ? 50 : 200
         
-        expandDebounceTimer = setTimeout(() => {
-          // 检查是否正在动画
-          if (isAnimating) return
+        expandDebounceTimer = trackTimer(setTimeout(() => {
+          // 检查是否正在动画或已卸载
+          if (isDestroyed || isAnimating) return
           
           // 检查待执行状态是否仍需要执行（可能已被后续滚动覆盖）
           if (pendingState === null || pendingState === isExpanded.value) return
@@ -504,25 +520,28 @@ const initObserver = () => {
           pendingState = null
           
           // 动画完成后解除锁定，并检查是否有待处理的状态变化
-          setTimeout(() => {
+          trackTimer(setTimeout(() => {
+            if (isDestroyed) return
             isAnimating = false
             
             // 动画结束后，检查是否有新的待执行状态
             if (pendingState !== null && pendingState !== isExpanded.value) {
               // 延迟一小段时间再执行，避免太快切换
-              expandDebounceTimer = setTimeout(() => {
+              expandDebounceTimer = trackTimer(setTimeout(() => {
+                if (isDestroyed) return
                 if (pendingState !== null && pendingState !== isExpanded.value) {
                   isAnimating = true
                   isExpanded.value = pendingState
                   pendingState = null
-                  setTimeout(() => {
+                  trackTimer(setTimeout(() => {
+                    if (isDestroyed) return
                     isAnimating = false
-                  }, 750)
+                  }, 750))
                 }
-              }, 100)
+              }, 100))
             }
-          }, 750)
-        }, delay)
+          }, 750))
+        }, delay))
       })
     },
     {
@@ -552,9 +571,10 @@ onMounted(async () => {
   await loadHistory()
   
   // 等待 DOM 渲染后初始化观察器
-  setTimeout(() => {
+  trackTimer(setTimeout(() => {
+    if (isDestroyed) return
     initObserver()
-  }, 100)
+  }, 100))
 })
 
 // 如果使用 keep-alive，在组件激活时重新加载数据
@@ -563,16 +583,14 @@ onActivated(() => {
 })
 
 onUnmounted(() => {
+  isDestroyed = true
   // 清理 Intersection Observer
   if (observer) {
     observer.disconnect()
     observer = null
   }
-  // 清理防抖定时器
-  if (expandDebounceTimer) {
-    clearTimeout(expandDebounceTimer)
-    expandDebounceTimer = null
-  }
+  // 清理所有定时器（包含挂载延时与嵌套防抖定时器）
+  clearAllTimers()
 })
 </script>
 

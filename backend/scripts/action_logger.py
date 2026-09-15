@@ -122,14 +122,19 @@ class SimulationLogManager:
     统一管理所有日志文件，按平台分离
     """
     
-    def __init__(self, simulation_dir: str):
+    def __init__(self, simulation_dir: str, main_log_path: Optional[str] = None):
         """
         初始化日志管理器
         
         Args:
             simulation_dir: 模拟目录路径
+            main_log_path: 主日志文件路径（默认 <simulation_dir>/simulation.log）。
+                由后端启动时，父进程已用 'w' 模式打开 <simulation_dir>/simulation.log
+                并作为子进程的 stdout/stderr，因此子进程必须写入不同路径，避免两处
+                句柄截断/交叉写入同一个文件。
         """
         self.simulation_dir = simulation_dir
+        self.main_log_path = main_log_path or os.path.join(simulation_dir, "simulation.log")
         self.twitter_logger: Optional[PlatformActionLogger] = None
         self.reddit_logger: Optional[PlatformActionLogger] = None
         self._main_logger: Optional[logging.Logger] = None
@@ -139,7 +144,10 @@ class SimulationLogManager:
     
     def _setup_main_logger(self):
         """设置主模拟日志"""
-        log_path = os.path.join(self.simulation_dir, "simulation.log")
+        log_path = self.main_log_path
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
         
         # 创建 logger
         self._main_logger = logging.getLogger(f"simulation.{os.path.basename(self.simulation_dir)}")

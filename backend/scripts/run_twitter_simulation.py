@@ -610,21 +610,29 @@ class TwitterSimulationRunner:
         if initial_posts:
             print(f"执行初始事件 ({len(initial_posts)}条初始帖子)...")
             initial_actions = {}
+            initial_post_count = 0
             for post in initial_posts:
                 agent_id = post.get("poster_agent_id", 0)
                 content = post.get("content", "")
                 try:
                     agent = self.env.agent_graph.get_agent(agent_id)
-                    initial_actions[agent] = ManualAction(
+                    action = ManualAction(
                         action_type=ActionType.CREATE_POST,
                         action_args={"content": content}
                     )
+                    if agent in initial_actions:
+                        if not isinstance(initial_actions[agent], list):
+                            initial_actions[agent] = [initial_actions[agent]]
+                        initial_actions[agent].append(action)
+                    else:
+                        initial_actions[agent] = action
+                    initial_post_count += 1
                 except Exception as e:
                     print(f"  警告: 无法为Agent {agent_id}创建初始帖子: {e}")
             
             if initial_actions:
                 await self.env.step(initial_actions)
-                print(f"  已发布 {len(initial_actions)} 条初始帖子")
+                print(f"  已发布 {initial_post_count} 条初始帖子")
         
         # 主模拟循环
         print("\n开始模拟循环...")

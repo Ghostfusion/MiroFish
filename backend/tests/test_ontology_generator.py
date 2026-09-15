@@ -65,6 +65,30 @@ def test_very_long_ontology_context_selects_representative_chunks():
     assert context.count("--- 文档 1 / 分块") == generator.MAX_LONG_TEXT_CHUNKS
 
 
+def _entity(entity_type: str) -> dict:
+    return {
+        "name": entity_type,
+        "description": f"A {entity_type} entity.",
+        "attributes": [{"name": "details", "type": "text", "description": "d"}],
+        "examples": [],
+    }
+
+
+def test_oversized_ontology_keeps_the_fallback_entity_types():
+    generator = OntologyGenerator(llm_client=object())
+    entity_types = [_entity(f"Specific{i}") for i in range(10)]
+    entity_types += [_entity("Person"), _entity("Organization")]
+
+    result = generator._validate_and_process(
+        {"entity_types": entity_types, "edge_types": [], "analysis_summary": ""}
+    )
+
+    names = [entity["name"] for entity in result["entity_types"]]
+    assert len(names) <= 10
+    assert "Person" in names
+    assert "Organization" in names
+
+
 def test_ontology_generation_does_not_cap_structured_output_tokens():
     llm = RecordingLLMClient()
     generator = OntologyGenerator(llm_client=llm)

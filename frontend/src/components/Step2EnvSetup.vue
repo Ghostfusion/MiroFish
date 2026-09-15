@@ -960,6 +960,7 @@ const fetchProfilesRealtime = async () => {
 
 // 配置轮询
 const startConfigPolling = () => {
+  if (configTimer) return
   configTimer = setInterval(fetchConfigRealtime, 2000)
 }
 

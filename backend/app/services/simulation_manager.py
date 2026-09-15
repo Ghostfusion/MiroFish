@@ -6,6 +6,7 @@ OASIS模拟管理器
 
 import os
 import json
+import re
 import shutil
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ from datetime import datetime
 from enum import Enum
 
 from ..config import Config
+from ..utils.json_files import read_json, write_json_atomic
 from ..utils.logger import get_logger
 from .zep_entity_reader import ZepEntityReader, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
@@ -20,6 +22,16 @@ from .simulation_config_generator import SimulationConfigGenerator, SimulationPa
 from ..utils.locale import t
 
 logger = get_logger('mirofish.simulation')
+
+# 模拟ID只允许生成的 sim_<hex> 形式，避免请求传入的ID逃逸出模拟根目录
+_SIMULATION_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def is_valid_simulation_id(simulation_id: str) -> bool:
+    """判断模拟ID是否为安全的单层目录名"""
+    return isinstance(simulation_id, str) and bool(
+        _SIMULATION_ID_PATTERN.fullmatch(simulation_id)
+    )
 
 
 class SimulationStatus(str, Enum):
@@ -149,10 +161,21 @@ class SimulationManager:
         # 内存中的模拟状态缓存
         self._simulations: Dict[str, SimulationState] = {}
     
-    def _get_simulation_dir(self, simulation_id: str) -> str:
-        """获取模拟数据目录"""
+    def _get_simulation_dir(self, simulation_id: str, *, create: bool = True) -> str:
+        """
+        获取模拟数据目录
+
+        Args:
+            simulation_id: 模拟ID
+            create: 是否创建目录。读取路径必须传 False，否则一个任意
+                    请求ID就能在磁盘上创建目录（甚至可以逃逸出模拟根目录）
+        """
+        if not is_valid_simulation_id(simulation_id):
+            raise ValueError(f"非法的模拟ID: {simulation_id!r}")
+        
         sim_dir = os.path.join(self.SIMULATION_DATA_DIR, simulation_id)
-        os.makedirs(sim_dir, exist_ok=True)
+        if create:
+            os.makedirs(sim_dir, exist_ok=True)
         return sim_dir
     
     def _save_simulation_state(self, state: SimulationState):
@@ -162,8 +185,7 @@ class SimulationManager:
         
         state.updated_at = datetime.now().isoformat()
         
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
+        write_json_atomic(state_file, state.to_dict())
         
         self._simulations[state.simulation_id] = state
     
@@ -172,14 +194,16 @@ class SimulationManager:
         if simulation_id in self._simulations:
             return self._simulations[simulation_id]
         
-        sim_dir = self._get_simulation_dir(simulation_id)
+        if not is_valid_simulation_id(simulation_id):
+            return None
+        
+        sim_dir = self._get_simulation_dir(simulation_id, create=False)
         state_file = os.path.join(sim_dir, "state.json")
         
         if not os.path.exists(state_file):
             return None
         
-        with open(state_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        data = read_json(state_file)
         
         state = SimulationState(
             simulation_id=simulation_id,
@@ -510,7 +534,7 @@ class SimulationManager:
         if platform not in {"twitter", "reddit"}:
             raise ValueError(f"不支持的平台: {platform}")
 
-        sim_dir = self._get_simulation_dir(simulation_id)
+        sim_dir = self._get_simulation_dir(simulation_id, create=False)
         profile_path = os.path.join(
             sim_dir,
             "twitter_profiles.csv" if platform == "twitter" else "reddit_profiles.json",
@@ -530,18 +554,20 @@ class SimulationManager:
     
     def get_simulation_config(self, simulation_id: str) -> Optional[Dict[str, Any]]:
         """获取模拟配置"""
-        sim_dir = self._get_simulation_dir(simulation_id)
+        if not is_valid_simulation_id(simulation_id):
+            return None
+        
+        sim_dir = self._get_simulation_dir(simulation_id, create=False)
         config_path = os.path.join(sim_dir, "simulation_config.json")
         
         if not os.path.exists(config_path):
             return None
         
-        with open(config_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        return read_json(config_path)
     
     def get_run_instructions(self, simulation_id: str) -> Dict[str, str]:
         """获取运行说明"""
-        sim_dir = self._get_simulation_dir(simulation_id)
+        sim_dir = self._get_simulation_dir(simulation_id, create=False)
         config_path = os.path.join(sim_dir, "simulation_config.json")
         scripts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../scripts'))
         

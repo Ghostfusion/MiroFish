@@ -939,8 +939,7 @@ const handleClickOutside = (e) => {
 // Lifecycle
 onMounted(() => {
   addLog(t('log.step5Init'))
-  loadReportData()
-  loadProfiles()
+  // 初始加载由下方 immediate watcher 负责，避免重复请求
   document.addEventListener('click', handleClickOutside)
 })
 

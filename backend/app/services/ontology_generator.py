@@ -544,8 +544,21 @@ class OntologyGenerator:
             # 添加兜底类型
             result["entity_types"].extend(fallbacks_to_add)
         
-        # 最终确保不超过限制（防御性编程）
-        result["entity_types"] = result["entity_types"][:MAX_ONTOLOGY_TYPES]
+        # 最终确保不超过限制（防御性编程）。模型超量输出时不能截掉兜底类型：
+        # ONTOLOGY_SYSTEM_PROMPT 要求把 Person/Organization 放在最后，
+        # 直接 [:MAX] 会把它们全部丢掉
+        if len(result["entity_types"]) > MAX_ONTOLOGY_TYPES:
+            fallback_names = {"Person", "Organization"}
+            fallbacks = [
+                entity for entity in result["entity_types"]
+                if entity["name"] in fallback_names
+            ]
+            others = [
+                entity for entity in result["entity_types"]
+                if entity["name"] not in fallback_names
+            ]
+            keep_slots = max(MAX_ONTOLOGY_TYPES - len(fallbacks), 0)
+            result["entity_types"] = others[:keep_slots] + fallbacks
 
         # Resolve edge endpoints only after entity fallback/capping, so an edge
         # cannot refer to a type that was removed to satisfy Zep's limits.

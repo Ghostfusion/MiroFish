@@ -1127,6 +1127,11 @@ class ZepToolsService:
             )
             
             sub_queries = response.get("sub_queries", [])
+            # 模型可能返回字符串而不是数组：直接迭代字符串会按字符拆成子查询
+            if isinstance(sub_queries, str):
+                sub_queries = [line.strip() for line in sub_queries.splitlines() if line.strip()]
+            if not isinstance(sub_queries, list):
+                sub_queries = []
             # 确保是字符串列表
             return [str(sq) for sq in sub_queries[:max_queries]]
             
@@ -1395,6 +1400,7 @@ class ZepToolsService:
             api_data = api_result.get("result", {})
             results_dict = api_data.get("results", {}) if isinstance(api_data, dict) else {}
             
+            missing_responses = 0
             for i, agent_idx in enumerate(selected_indices):
                 agent = selected_agents[i]
                 agent_name = agent.get("realname", agent.get("username", f"Agent_{agent_idx}"))
@@ -1411,15 +1417,28 @@ class ZepToolsService:
                 # 清理可能的工具调用 JSON 包裹
                 twitter_response = self._clean_tool_call_response(twitter_response)
                 reddit_response = self._clean_tool_call_response(reddit_response)
-
-                # 始终输出双平台标记
-                twitter_text = twitter_response if twitter_response else "（该平台未获得回复）"
-                reddit_text = reddit_response if reddit_response else "（该平台未获得回复）"
-                response_text = f"【Twitter平台回答】\n{twitter_text}\n\n【Reddit平台回答】\n{reddit_text}"
+                
+                # 单平台模拟只按裸 agent_id 作为键返回结果，此时不带平台前缀
+                single_platform_response = ""
+                if not twitter_response and not reddit_response:
+                    single_result = results_dict.get(str(agent_idx), {})
+                    if isinstance(single_result, dict):
+                        single_platform_response = self._clean_tool_call_response(
+                            single_result.get("response", "")
+                        )
+                
+                if single_platform_response:
+                    response_text = single_platform_response
+                else:
+                    # 始终输出双平台标记
+                    twitter_text = twitter_response if twitter_response else "（该平台未获得回复）"
+                    reddit_text = reddit_response if reddit_response else "（该平台未获得回复）"
+                    response_text = f"【Twitter平台回答】\n{twitter_text}\n\n【Reddit平台回答】\n{reddit_text}"
+                    missing_responses += 1 if not (twitter_response or reddit_response) else 0
 
                 # 提取关键引言（从两个平台的回答中）
                 import re
-                combined_responses = f"{twitter_response} {reddit_response}"
+                combined_responses = f"{twitter_response} {reddit_response} {single_platform_response}"
 
                 # 清理响应文本：去掉标记、编号、Markdown 等干扰
                 clean_text = re.sub(r'#{1,6}\s+', '', combined_responses)
@@ -1456,6 +1475,19 @@ class ZepToolsService:
                 result.interviews.append(interview)
             
             result.interviewed_count = len(result.interviews)
+            
+            if missing_responses:
+                logger.warning(
+                    f"采访未获得回复的Agent数量: {missing_responses}/{len(result.interviews)}, "
+                    f"simulation_id={simulation_id}"
+                )
+                if missing_responses == len(result.interviews):
+                    # 全部为空说明返回结构与预期不符，不能再据此生成"摘要"
+                    result.summary = (
+                        "采访未获得任何回复：模拟返回的结果结构与预期不符。"
+                        "请确认OASIS模拟环境正在运行，且模拟平台与本次采访一致。"
+                    )
+                    return result
             
         except ValueError as e:
             # 模拟环境未运行
@@ -1504,6 +1536,13 @@ class ZepToolsService:
         """加载模拟的Agent人设文件"""
         import os
         import csv
+        
+        from .simulation_manager import is_valid_simulation_id
+        
+        # simulation_id 由工具参数传入，必须校验后再参与路径拼接
+        if not is_valid_simulation_id(simulation_id):
+            logger.warning(f"拒绝读取非法模拟ID的人设文件: {simulation_id!r}")
+            return []
         
         # 构建人设文件路径
         sim_dir = os.path.join(
@@ -1668,7 +1707,16 @@ class ZepToolsService:
                 temperature=0.5
             )
             
-            return response.get("questions", [f"关于{interview_requirement}，您有什么看法？"])
+            questions = response.get("questions")
+            # 模型偶尔返回字符串而不是数组：直接迭代字符串会按字符拆成问题
+            if isinstance(questions, str):
+                questions = [line.strip() for line in questions.splitlines() if line.strip()]
+            elif isinstance(questions, list):
+                questions = [str(q).strip() for q in questions if str(q).strip()]
+            else:
+                questions = []
+            
+            return questions or [f"关于{interview_requirement}，您有什么看法？"]
             
         except Exception as e:
             logger.warning(t("console.generateInterviewQuestionsFailed", error=e))

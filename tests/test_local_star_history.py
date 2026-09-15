@@ -20,6 +20,16 @@ UTC = timezone.utc
 TOKEN_SENTINEL = "TOKEN_TEST_DO_NOT_LEAK_7z9"
 
 
+def symlink_or_skip(link: Path, target: Path) -> None:
+    """Create ``link`` or skip the test where symlinks are unavailable."""
+
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:
+        # e.g. Windows without SeCreateSymbolicLinkPrivilege (WinError 1314)
+        raise unittest.SkipTest(f"symbolic links are unavailable: {exc}") from exc
+
+
 class FixedClock:
     def __init__(self, value: str):
         self.value = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
@@ -244,7 +254,7 @@ class StarHistoryBehaviorTests(unittest.TestCase):
             workspace = Path(temporary)
             state_path = workspace / ".github/star-history/history.json"
             state_path.parent.mkdir(parents=True)
-            state_path.symlink_to(workspace / "missing-history.json")
+            symlink_or_skip(state_path, workspace / "missing-history.json")
 
             with self.assertRaises(star_history.StarHistoryError):
                 star_history.execute(
@@ -436,7 +446,7 @@ class StarHistoryBehaviorTests(unittest.TestCase):
                     star_history.load_star_count_file(path)
 
             link = root / "link"
-            link.symlink_to(valid)
+            symlink_or_skip(link, valid)
             with self.assertRaises(star_history.StarHistoryError):
                 star_history.load_star_count_file(link)
 

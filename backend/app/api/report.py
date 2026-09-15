@@ -3,8 +3,8 @@ Report API路由
 提供模拟报告生成、获取、对话等接口
 """
 
+import io
 import os
-import traceback
 import threading
 from flask import request, jsonify, send_file
 
@@ -55,7 +55,7 @@ def generate_report():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         simulation_id = data.get('simulation_id')
         if not simulation_id:
@@ -315,7 +315,6 @@ def generate_report():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -342,7 +341,7 @@ def get_generate_status():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         task_id = data.get('task_id')
         simulation_id = data.get('simulation_id')
@@ -431,7 +430,6 @@ def get_report(report_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -470,7 +468,6 @@ def get_report_by_simulation(simulation_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -510,7 +507,6 @@ def list_reports():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -533,14 +529,10 @@ def download_report(report_id: str):
         md_path = ReportManager._get_report_markdown_path(report_id)
         
         if not os.path.exists(md_path):
-            # 如果MD文件不存在，生成一个临时文件
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
-                f.write(report.markdown_content)
-                temp_path = f.name
-            
+            # 如果MD文件不存在，直接在内存中返回，避免临时文件泄漏
             return send_file(
-                temp_path,
+                io.BytesIO((report.markdown_content or '').encode('utf-8')),
+                mimetype='text/markdown',
                 as_attachment=True,
                 download_name=f"{report_id}.md"
             )
@@ -556,7 +548,6 @@ def download_report(report_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -582,7 +573,6 @@ def delete_report(report_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -616,7 +606,7 @@ def chat_with_report_agent():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         simulation_id = data.get('simulation_id')
         message = data.get('message')
@@ -679,7 +669,6 @@ def chat_with_report_agent():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -722,7 +711,6 @@ def get_report_progress(report_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -773,7 +761,6 @@ def get_report_sections(report_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -791,6 +778,12 @@ def get_single_section(report_id: str, section_index: int):
             }
         }
     """
+    if not ReportManager.is_valid_report_id(report_id):
+        return jsonify({
+            "success": False,
+            "error": t('api.reportNotFound', id=report_id)
+        }), 404
+    
     try:
         section_path = ReportManager._get_section_path(report_id, section_index)
         
@@ -817,7 +810,6 @@ def get_single_section(report_id: str, section_index: int):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -868,7 +860,6 @@ def check_report_status(simulation_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -929,7 +920,6 @@ def get_agent_log(report_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -963,7 +953,6 @@ def stream_agent_log(report_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1011,7 +1000,6 @@ def get_console_log(report_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1045,7 +1033,6 @@ def stream_console_log(report_id: str):
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1064,7 +1051,7 @@ def search_graph_tool():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         graph_id = data.get('graph_id')
         query = data.get('query')
@@ -1095,7 +1082,6 @@ def search_graph_tool():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1110,7 +1096,7 @@ def get_graph_statistics_tool():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         
         graph_id = data.get('graph_id')
         
@@ -1135,5 +1121,4 @@ def get_graph_statistics_tool():
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500

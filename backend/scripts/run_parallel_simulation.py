@@ -21,7 +21,9 @@ OASIS 双平台并行模拟预设脚本
     │   └── actions.jsonl    # Twitter 平台动作日志
     ├── reddit/
     │   └── actions.jsonl    # Reddit 平台动作日志
-    ├── simulation.log       # 主模拟进程日志
+    ├── simulation.log       # 主进程日志（后端启动时为子进程 stdout/stderr 捕获）
+    ├── log/
+    │   └── simulation.log   # 子进程自身的主日志（避免与上面的捕获文件冲突）
     └── run_state.json       # 运行状态（API 查询用）
 """
 
@@ -1184,10 +1186,17 @@ async def run_twitter_simulation(
             content = post.get("content", "")
             try:
                 agent = result.env.agent_graph.get_agent(agent_id)
-                initial_actions[agent] = ManualAction(
+                action = ManualAction(
                     action_type=ActionType.CREATE_POST,
                     action_args={"content": content}
                 )
+                if agent in initial_actions:
+                    if not isinstance(initial_actions[agent], list):
+                        initial_actions[agent] = [initial_actions[agent]]
+                    initial_actions[agent].append(action)
+                else:
+                    initial_actions[agent] = action
+                initial_action_count += 1
                 
                 if action_logger:
                     action_logger.log_action(
@@ -1198,13 +1207,12 @@ async def run_twitter_simulation(
                         action_args={"content": content}
                     )
                     total_actions += 1
-                    initial_action_count += 1
             except Exception:
                 pass
         
         if initial_actions:
             await result.env.step(initial_actions)
-            log_info(f"已发布 {len(initial_actions)} 条初始帖子")
+            log_info(f"已发布 {initial_action_count} 条初始帖子")
     
     # 记录 round 0 结束
     if action_logger:
@@ -1538,7 +1546,13 @@ async def main():
     init_logging_for_simulation(simulation_dir)
     
     # 创建日志管理器
-    log_manager = SimulationLogManager(simulation_dir)
+    # 注意：后端启动本脚本时，父进程 simulation_runner.py 已用 'w' 模式打开
+    # <simulation_dir>/simulation.log 并作为本进程的 stdout/stderr；本进程的
+    # 文件日志必须写到不同路径，否则两个句柄会互相截断/交叉写入同一个文件。
+    log_manager = SimulationLogManager(
+        simulation_dir,
+        main_log_path=os.path.join(simulation_dir, "log", "simulation.log")
+    )
     twitter_logger = log_manager.get_twitter_logger()
     reddit_logger = log_manager.get_reddit_logger()
     

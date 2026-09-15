@@ -8,7 +8,7 @@ import threading
 from datetime import datetime
 from enum import Enum
 from typing import Dict, Any, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..utils.locale import t
 
@@ -67,9 +67,11 @@ class TaskManager:
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-                    cls._instance._tasks: Dict[str, Task] = {}
-                    cls._instance._task_lock = threading.Lock()
+                    instance = super().__new__(cls)
+                    instance._tasks: Dict[str, Task] = {}
+                    instance._task_lock = threading.Lock()
+                    # 先完成初始化再发布，避免其他线程拿到未初始化完的实例
+                    cls._instance = instance
         return cls._instance
     
     def create_task(self, task_type: str, metadata: Optional[Dict] = None) -> str:
@@ -101,9 +103,16 @@ class TaskManager:
         return task_id
     
     def get_task(self, task_id: str) -> Optional[Task]:
-        """获取任务"""
+        """获取任务
+
+        返回字段的一致性快照：后台线程仍在通过 update_task 修改同一个对象，
+        直接把实例交出去会让调用方读到字段互相不匹配的状态。
+        """
         with self._task_lock:
-            return self._tasks.get(task_id)
+            task = self._tasks.get(task_id)
+            if task is None:
+                return None
+            return replace(task)
     
     def update_task(
         self,

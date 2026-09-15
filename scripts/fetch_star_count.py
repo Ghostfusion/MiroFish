@@ -37,12 +37,18 @@ def _build_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(NoRedirectHandler())
 
 
-def _status_error(status: int) -> FetchError:
+def _status_error(
+    status: int, *, rate_limit_remaining: str | None = None
+) -> FetchError:
     if status in {301, 302, 303, 307, 308}:
         return FetchError("GitHub API redirect was refused")
     if status == 401:
         return FetchError("GitHub API authentication failed")
     if status == 403:
+        # GitHub returns 403 (not 429) when the token's core rate limit is
+        # exhausted, so the header is the only way to tell it from a scope error.
+        if rate_limit_remaining == "0":
+            return FetchError("GitHub API rate limit was exhausted")
         return FetchError("GitHub API request was denied")
     if status == 404:
         return FetchError("repository metadata was not found")
@@ -88,8 +94,10 @@ def fetch_star_count(token: str, opener: Any | None = None) -> int:
         response = client.open(request, timeout=TIMEOUT_SECONDS)
     except urllib.error.HTTPError as exc:
         status = exc.code
+        headers = exc.headers
         exc.close()
-        raise _status_error(status) from None
+        remaining = headers.get("X-RateLimit-Remaining") if headers else None
+        raise _status_error(status, rate_limit_remaining=remaining) from None
     except (urllib.error.URLError, TimeoutError, OSError):
         raise FetchError("GitHub API network request failed") from None
     except Exception:
