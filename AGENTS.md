@@ -82,7 +82,7 @@ Verification: backend suite 153 passed; live smoke test on :5001.
 | Backend interpreter | `backend/.venv/Scripts/python.exe` (Python 3.12). Never the system interpreter — it has no Flask. |
 | Backend entry point | `cd backend && python run.py` (port `5001`, `Flask` + daemon threads) |
 | Frontend | `frontend/` — Vue 3 + Vite; `npm install`, `npm run dev` (:3000), `npm run build` |
-| Required config | `LLM_API_KEY`, `ZEP_API_KEY` in `.env` (repo root); startup refuses without them |
+| Required config | `LLM_API_KEY` plus the graph settings (`GRAPH_BACKEND`, `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, optional `KUZU_DB_PATH`, `EMBEDDING_MODEL_NAME`, `EMBEDDING_DIM`) in `.env` (repo root); startup refuses without them. `.env.example` is the authoritative template. |
 | Suites | `backend/tests` (pytest) and the root `tests/` (star-history tooling) |
 
 ## 6. Scope discipline

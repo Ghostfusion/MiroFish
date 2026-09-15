@@ -1,6 +1,5 @@
 from types import SimpleNamespace
 
-import pytest
 from flask import Flask
 
 from app.api import graph as graph_api
@@ -8,7 +7,7 @@ from app.api import report as report_api
 from app.models.project import ProjectStatus
 from app.services.simulation_manager import SimulationStatus
 from app.services.simulation_runner import RunnerStatus
-from app.utils.zep_lifecycle import (
+from app.utils.graph_lifecycle import (
     get_graph_readers,
     unregister_graph_reader,
 )
@@ -213,6 +212,11 @@ def test_report_reader_lease_blocks_graph_delete(monkeypatch):
         "SimulationManager",
         lambda: SimpleNamespace(list_simulations=lambda: []),
     )
+    monkeypatch.setattr(
+        graph_api.ProjectManager,
+        "get_project",
+        classmethod(lambda _cls, _project_id: project),
+    )
 
     app = Flask(__name__)
     report_id = None
@@ -228,8 +232,14 @@ def test_report_reader_lease_blocks_graph_delete(monkeypatch):
         assert get_graph_readers("graph-1") == [report_id]
         assert len(worker_targets) == 1
 
-        with pytest.raises(graph_api.GraphInUseError, match=f"report:{report_id}"):
-            graph_api._delete_cloud_graph_if_present("graph-1")
+        with app.test_request_context(
+            "/api/graph/project/proj-1",
+            method="DELETE",
+        ):
+            blocked, blocked_status = _json_result(graph_api.delete_project("proj-1"))
+
+        assert blocked_status == 409
+        assert f"report:{report_id}" in blocked["error"]
 
         # Let the parked background report finish; its finally block must
         # release the lease even if report generation fails.

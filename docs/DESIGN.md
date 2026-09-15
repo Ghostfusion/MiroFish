@@ -12,7 +12,7 @@ summaries) into a *runnable social simulation* and then into a report about it:
 
 1. Extract an **ontology** (entity/edge types) from the documents and the user's prediction
    requirement.
-2. Build a **knowledge graph** in Zep Cloud (GraphRAG) with temporal memory.
+2. Build a **knowledge graph** in a local, in-process GraphRAG store (`graphiti_core`) with temporal memory.
 3. Turn the graph's entities into **agents** with LLM-generated personas, and generate the
    simulation parameters (world clock, per-agent activity, recommendation weights, initial
    events).
@@ -31,7 +31,7 @@ resilience against LLM/provider misbehaviour, and only then throughput.
 | **Seed / 现实种子** | The uploaded documents plus the natural-language prediction requirement. |
 | **Ontology / 本体** | `{entity_types, edge_types, analysis_summary}` — the schema and prompt contract for graph extraction. |
 | **Project** | Server-side container for one upload: files, extracted text, ontology, graph id. Persisted as `project.json`. |
-| **Graph** | A Zep Cloud graph (`mirofish_<hex>`), the GraphRAG store. |
+| **Graph** | A graph in the local graph database, addressed by its group id (`mirofish_<hex>`); the GraphRAG store. |
 | **Entity / Node** | A graph node with a `name`, `summary`, `labels` (ontology type) and attributes. |
 | **Fact / Edge** | A temporal fact between two nodes with `valid_at` / `invalid_at` / `expired_at`. |
 | **Simulation** | One environment built from a graph: profiles + config + optionally running processes. |
@@ -54,7 +54,7 @@ flowchart LR
     API["api/graph.py · api/simulation.py · api/report.py"]
     SVC["services/*\n(ontology, graph, profiles, config, runner, report)"]
     MODEL["models/* (projects, tasks)"]
-    UTIL["utils/* (zep, llm_client, json_files, locale, logger)"]
+    UTIL["utils/* (graph_client, llm_client, json_files, locale, logger)"]
     FS[["backend/uploads/**\nprojects · simulations · reports"]]
     SPA -->|REST /api/**| API
     API --> SVC --> MODEL
@@ -72,22 +72,25 @@ flowchart LR
 
   subgraph Cloud["External services"]
     LLM["OpenAI-compatible LLM API"]
-    ZEP["Zep Cloud (GraphRAG)"]
   end
+
+  GRAPH["Local graph database\n(Neo4j over Bolt, or embedded Kuzu)\nreached through graphiti_core"]
 
   SVC -->|spawn + monitor| RUN
   ACTLOG -->|tail| SVC
   UTIL --> LLM
-  UTIL --> ZEP
+  SVC --> GRAPH
+  UTIL --> GRAPH
   SVC -->|IPC files| RUN
 ```
 
-Three moving parts exchange state through the file system and the Zep/LLM APIs:
+Three moving parts exchange state through the file system, the local graph database and
+the LLM API:
 
 * the **Flask backend** owns all state and HTTP surface;
 * one **simulation process pair** per run (or a single dual-platform process) owns the live
   OASIS environments and the on-disk SQLite databases;
-* **Zep Cloud** owns the knowledge graph and its derived memory.
+* the **local graph database** (Neo4j, or embedded Kuzu, reached through `graphiti_core`) owns the knowledge graph and its derived memory.
 
 ## 4. Repository layout
 
@@ -100,12 +103,11 @@ backend/
     models/                  # Project/ProjectManager, Task/TaskManager (in-memory)
     api/                     # graph.py, simulation.py, report.py (Flask blueprints)
     services/                # ontology, graph build, profiles, config gen, runner, report,
-                             # zep_tools, zep_entity_reader, ipc, zep_graph_memory_updater
-                             # (last one: manual Cloud validation only, not wired to runs)
-    utils/                   # llm_client, zep (+paging, lifecycle), json_files, locale,
+                             # graph_tools, graph_entity_reader, ipc
+    utils/                   # llm_client, graph_client (+lifecycle), json_files, locale,
                              # logger, file_parser, ontology, openai_chat_compat, retry
-  scripts/                   # run_*_simulation.py (OASIS), action_logger.py, validators
-  tests/                     # pytest suite (153 tests)
+  scripts/                   # run_*_simulation.py (OASIS), action_logger.py, test_profile_format.py
+  tests/                     # pytest suite (see AGENTS.md section 2 for the required check)
 frontend/                    # Vue 3 + vite + vue-i18n + d3 SPA (:3000, proxies /api)
 locales/                     # zh.json / en.json / languages.json (shared backend + frontend)
 scripts/                     # repo star-history tooling (CI, unrelated to the product)
@@ -132,7 +134,7 @@ Vue 3 (`<script setup>`), vue-router (history mode), vue-i18n (composition API, 
 unwraps `{success, data}` and promotes `error` strings onto `error.message`), and d3 for the
 force-directed graph panel. All server interaction goes through
 `api/{graph,report,simulation}.js`; all user-visible strings come from `locales/*.json`
-(199 keys, identical key sets in both locales).
+(628 keys, identical key sets in both locales).
 
 Routes → views:
 
@@ -167,7 +169,7 @@ stateDiagram-v2
     [*] --> created
     created --> ontology_generated: POST /api/graph/ontology/generate
     ontology_generated --> graph_building: POST /api/graph/build
-    graph_building --> graph_completed: Zep batch processed
+    graph_building --> graph_completed: chunks ingested synchronously
     graph_building --> failed
     graph_completed --> ontology_generated: reset (graph deleted)
   }
@@ -263,18 +265,18 @@ These are load-bearing; keep them when extending the code.
    and skipped — the offset must never rewind, otherwise that record would be replayed.
 5. **A monitor starts where the current run starts.** `_monitor_simulation()` initialises
    its offsets to the current size of each `actions.jsonl`, so restarting a simulation does
-   not replay the previous run's actions into counts or into Zep.
-6. **Per-graph lifecycle lock** (`utils/zep_lifecycle.py`): an `RLock` per graph id,
-   re-entrant so a caller can hold it across a consumer check and the Cloud mutation.
+   not replay the previous run's actions into counts or into the graph.
+6. **Per-graph lifecycle lock** (`utils/graph_lifecycle.py`): an `RLock` per graph id,
+   re-entrant so a caller can hold it across a consumer check and the graph mutation.
    Report generation registers itself as a *graph reader* for the lifetime of the report;
    graph reset/delete refuses while readers or active simulations exist (`GraphInUseError`).
 7. **Per-simulation finalization barrier**
    (`SimulationRunner._finalization_lock`): manual stop and natural process exit can observe
    the same exit; the lock serialises the terminal state write so exactly one path owns the
    final result.
-8. **A simulation never writes back to its graph.** Nothing in the run path constructs a Zep
-   writer: there is no request field, no runner parameter and no registry for one. The only
-   graph mutation the product performs is the seed ingestion of Pipeline 1 (§8); report and
+8. **A simulation never writes back to its graph.** Nothing in the run path constructs a
+   graph writer: there is no request field, no runner parameter and no registry for one. The
+   only graph mutation the product performs is the seed ingestion of Pipeline 1 (§8); report and
    interview traffic against a live simulation is read-only with respect to the graph.
 9. **Progress objects are snapshots.** `TaskManager.get_task()` returns a copy; routes never
    iterate or serialise an object that a worker thread is mutating.
@@ -294,7 +296,7 @@ sequenceDiagram
   participant A as api/graph.py
   participant O as OntologyGenerator
   participant G as GraphBuilderService
-  participant Z as Zep Cloud
+  participant D as Local graph DB (graphiti_core)
   U->>A: POST /api/graph/ontology/generate (files + requirement)
   A->>A: ProjectManager.create_project(), save files
   A->>O: generate(document_texts, requirement)
@@ -303,9 +305,8 @@ sequenceDiagram
   U->>A: POST /api/graph/build {project_id, chunk_size, chunk_overlap}
   A->>G: build_graph_async(...)  (daemon thread)
   G->>G: TextProcessor.split_text → chunks
-  G->>Z: create graph, set ontology (dynamic Pydantic models)
-  G->>Z: batch create → add items (350 chunks/group) → process
-  G->>Z: poll batch until terminal, then poll episodes until processed
+  G->>D: open the group, register ontology types (dynamic Pydantic models)
+  G->>D: add_episode per chunk, synchronously (no batch, no polling)
   A-->>U: task progress (polled every 2 s)
 ```
 
@@ -320,13 +321,11 @@ Details that matter:
   (`MAX_ONTOLOGY_ATTRIBUTES = 10`), types capped at `MAX_ONTOLOGY_TYPES = 10`, and the
   `Person`/`Organization` catch-all types are always present (the cap preserves them).
   Long documents are compressed into representative chunks before the LLM call.
-* **Batch ingestion** (`services/graph_builder.py`): one Zep batch per build with a stable
-  `build_operation_id` (hash of graph id + chunk payload). `create` is reconciled by
-  operation id (`_find_batch_by_operation_id`) when the create reply is ambiguous, and
-  `_wait_for_batch` accepts only the five terminal batch states, re-validating item count,
-  status and episode UUIDs (sorted by `sequence_index`) before returning.
-* **Episode wait** (`_wait_for_episodes`): polls `graph.episode.get(uuid_)` until every
-  episode is `processed` or the deadline (`ZEP_INGESTION_WAIT_TIMEOUT_SECONDS = 600`) fires.
+* **Synchronous ingestion** (`services/graph_builder.py`): one `graph_client.add_episode`
+  call per chunk, in pages of 200 (`PAGE_SIZE`). The call returns only once the episode and
+  its nodes and edges are written, so the build worker owns the whole write and a stored
+  episode is queryable immediately: there is no batch id, no operation-id reconciliation, no
+  resume path and no deadline.
 
 ## 9. Pipeline 2 — environment setup
 
@@ -335,8 +334,8 @@ in a daemon thread:
 
 ```mermaid
 flowchart TB
-  S["state.json: preparing"] --> E["ZepEntityReader.filter_defined_entities\n(entities by ontology type + context)"]
-  E --> P["OasisProfileGenerator\ngenerate_profiles_from_entities\n(parallel, LLM + Zep retrieval)"]
+  S["state.json: preparing"] --> E["GraphEntityReader.filter_defined_entities\n(entities by ontology type + context)"]
+  E --> P["OasisProfileGenerator\ngenerate_profiles_from_entities\n(parallel, LLM + graph retrieval)"]
   P --> W["profiles written: reddit_profiles.json / twitter_profiles.csv"]
   W --> C["SimulationConfigGenerator\nLLM → SimulationParameters"]
   C --> F["simulation_config.json + state.json: ready"]
@@ -370,7 +369,7 @@ flowchart TB
    status is only published in the `finally` block, under the finalization lock, after the
    process exited and the final action-log tail was read.
 5. Action records are only counted and served (`/run-status`, `/actions`, `/timeline`,
-   `/agent-stats`). They are never written back to the Zep graph (§7.2 invariant 8).
+   `/agent-stats`). They are never written back to the graph (§7.2 invariant 8).
 
 Interviews (`/api/simulation/interview*`) run through the file IPC protocol:
 
@@ -389,7 +388,7 @@ sequenceDiagram
 
 **Result-key contract.** A dual-platform process returns
 `{"twitter_<id>": …, "reddit_<id>": …}`; the single-platform scripts return `{"<id>": …}`.
-`zep_tools.interview_agents()` accepts both and reports an explicit failure when no reply is
+`graph_tools.interview_agents()` accepts both and reports an explicit failure when no reply is
 available, instead of inventing conversation content.
 
 ## 11. Pipeline 4 — report generation
@@ -424,11 +423,11 @@ route runs, and `/api/report` validates `report_id` in the manager.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | POST | `/ontology/generate` | upload seed files + requirement, create project, generate ontology (async) |
-| POST | `/build` | build the Zep graph for a project (async task) |
+| POST | `/build` | build the local graph for a project (async task) |
 | GET | `/task/<task_id>`, `/tasks` | task progress |
 | GET | `/project/<project_id>`, `/project/list` | project metadata |
 | POST | `/project/<project_id>/reset` | reset ontology/graph reference |
-| DELETE | `/project/<project_id>`, `/delete/<graph_id>` | delete project / Cloud graph (refused while in use) |
+| DELETE | `/project/<project_id>`, `/delete/<graph_id>` | delete project / graph (refused while in use) |
 | GET | `/data/<graph_id>` | graph payload for the d3 panel |
 
 ### `/api/simulation`
@@ -462,27 +461,30 @@ route runs, and `/api/report` validates `report_id` in the manager.
 ## 13. Configuration
 
 `app/config.py` loads `<repo root>/.env` (override) at import time. `Config.validate()`
-rejects a missing `LLM_API_KEY`/`ZEP_API_KEY` and an unsupported `ZEP_API_URL`
-(this integration is Cloud-only). See `../.env`.
+rejects a missing `LLM_API_KEY`, a `GRAPH_BACKEND` other than `neo4j`/`kuzu`, and a missing
+`NEO4J_PASSWORD` when the backend is Neo4j. `../.env.example` is the authoritative template.
 
 | Key | Default | Notes |
 | --- | --- | --- |
 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL_NAME` | — / OpenAI / `gpt-4o-mini` | any OpenAI-compatible endpoint |
 | `LLM_BOOST_*` | unset | optional second provider; **presence** enables it for one platform |
-| `ZEP_API_KEY` | — | required |
+| `GRAPH_BACKEND` | `neo4j` | `neo4j` or `kuzu`; anything else fails validation |
+| `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` | `bolt://localhost:7687` / `neo4j` / — | required when `GRAPH_BACKEND=neo4j` |
+| `KUZU_DB_PATH` | `backend/uploads/graph.kuzu` | file path for the embedded backend |
+| `EMBEDDING_MODEL_NAME` / `EMBEDDING_DIM` | `text-embedding-3-small` / `1024` | vectors written into the graph must match |
 | `FLASK_HOST` / `FLASK_PORT` / `FLASK_DEBUG` | `0.0.0.0` / `5001` / `False` | `run.py` |
 | `OASIS_DEFAULT_MAX_ROUNDS` | `10` | round cap when the request omits `max_rounds` |
 | `REPORT_AGENT_MAX_TOOL_CALLS` / `_MAX_REFLECTION_ROUNDS` / `_TEMPERATURE` | 5 / 2 / 0.5 | *not yet honoured* — the report agent currently uses class constants; see Known issues |
 
 Other Config constants: `MAX_CONTENT_LENGTH = 50 MB`, allowed uploads
-`pdf|md|txt|markdown`, `DEFAULT_CHUNK_SIZE = 500`, `DEFAULT_CHUNK_OVERLAP = 50`,
-`ZEP_HTTP_REQUEST_TIMEOUT_SECONDS = 60`, `ZEP_INGESTION_WAIT_TIMEOUT_SECONDS = 600`,
-`MAX_ZEP_SEARCH_QUERY_CHARS = 400`, `MAX_ZEP_SEARCH_RESULTS = 50`.
+`pdf|md|txt|markdown`, `DEFAULT_CHUNK_SIZE = 500`, `DEFAULT_CHUNK_OVERLAP = 50`. The graph
+client bounds every read and search (`utils/graph_client.py`): `PAGE_SIZE = 200`,
+`MAX_SEARCH_QUERY_CHARS = 400`, `MAX_SEARCH_RESULTS = 50`, `DEFAULT_SEARCH_LIMIT = 10`.
 
 ## 14. Observability
 
 * `utils/logger.py` — rotating file handler (`backend/logs/YYYY-MM-DD.log`, 10 MB × 5) plus
-  console; named loggers (`mirofish.api`, `mirofish.simulation`, `mirofish.zep`, …).
+  console; named loggers (`mirofish.api`, `mirofish.simulation`, `mirofish.graph`, …).
 * `ReportLogger` — per-report `agent_log.jsonl` (tool calls, LLM responses, section
   completions) served by `/<report_id>/agent-log`.
 * `ReportConsoleLogger` — per-report `console_log.txt`; note the handler is attached to
@@ -497,20 +499,20 @@ Other Config constants: `MAX_CONTENT_LENGTH = 50 MB`, allowed uploads
 | --- | --- | --- |
 | LLM returns truncated/invalid JSON | `LLMClient.chat_json()` retries once without an output-token cap, then raises `LLMResponseError` | task marked `failed` with the message in `state.json`/task |
 | Provider rejects `response_format` | one request without JSON mode (does not consume a content attempt) | transparent |
-| Zep read fails (transport/408/429/5xx) | retried with exponential backoff honouring `Retry-After` | transparent |
-| Zep write fails / ambiguous create | fail closed, never replayed (`_failed_batches`, `operation_id` diff) | operator re-runs with `force` after inspecting |
+| Graph read fails (backend unreachable, auth, timeout) | raises `GraphClientError` — a read never degrades to an empty result | fix the backend and retry |
+| Graph write fails mid-build | the build task fails carrying the error; the chunks already written stay in the graph | re-run `POST /build` with `force` after inspecting the log |
 | Simulation process exits non-zero | monitor records the last 2 000 chars of `simulation.log`, run state `failed` | `POST /start` with `force` (stops + cleans logs) |
 | Report generation aborted by an unexpected value | section loop is bounded; failure marks the report `failed`, written sections are kept | regenerate |
 | Graph in use by a reader/simulation | `GraphInUseError` → `409`-style refusal | wait or stop the consumer |
 
 ## 16. Testing
 
-* `backend/tests/` — 153 pytest tests, all offline: Zep and OpenAI are replaced by
+* `backend/tests/` — pytest suite, all offline: the graph client and OpenAI are replaced by
   doubles/`SimpleNamespace` clients, state lives in `tmp_path`, Flask routes are exercised
   through either `create_app().test_client()` or `test_request_context` + direct view calls.
-  Coverage focus: Zep Cloud contracts (retry policy, pagination, batch reconciliation,
-  barriers), LLM JSON handling, ontology normalization, profile normalization, simulation
-  barriers, path guards, atomic persistence, action-log tailing.
+  Coverage focus: graph lifecycle and report/simulation barriers, ontology normalization,
+  profile normalization, LLM JSON handling, path guards, atomic persistence, action-log
+  tailing. See `AGENTS.md` section 2 for the required check.
 * `tests/` — the repository's star-history tool suite (unrelated to the product), including
   CI-workflow assertions.
 * No JavaScript test suite: the frontend contract is enforced by the type of work it does
@@ -525,16 +527,15 @@ fails on the previous behaviour.
 | Goal | Touch points |
 | --- | --- |
 | New platform | `PlatformType`, `SimulationState.enable_*`, `backend/scripts/run_<platform>_simulation.py`, action-log path in `_monitor_simulation`, `_resolve_platform` whitelist, locales, `Step3Simulation.vue` cards |
-| New report tool | `ReportAgent.VALID_TOOL_NAMES`, `_get_tools_description()`, `_execute_tool()`, `ZepToolsService`, `Step4Report.vue` result component |
+| New report tool | `ReportAgent.VALID_TOOL_NAMES`, `_get_tools_description()`, `_execute_tool()`, `GraphToolsService`, `Step4Report.vue` result component |
 | New ontology attribute/type rules | `utils/ontology.py` limits, `ontology_generator._validate_and_process()` |
 | New durable state | add a JSON file, write it with `write_json_atomic`, read it with `read_json`, and decide who owns the lock |
 | New locale | add `locales/<key>.json` (must match the `zh` key set exactly) and an entry in `locales/languages.json` |
-| Replacing Zep | `utils/zep.py` + `utils/zep_paging.py` + `services/zep_*` are the only Zep-aware modules; the API layer does not import `zep_cloud` except for `NotFoundError` |
+| Swapping graph storage | `utils/graph_client.py` is the only module that talks to `graphiti_core`; services and routes call it, so a new backend changes that file and the `GRAPH_BACKEND` branch alone |
 
 ## 18. Open issues
 
 See [`CHANGELOG.md`](../CHANGELOG.md) → *Known issues* for the reviewed-but-unfixed list
 (unbounded id-keyed lock maps, cross-report console-log contamination, the 10 000-action
 analysis cap, `insight_forge` per-node error swallowing, missing action logs for
-single-platform runs, IPC response-file hygiene, `zep_paging` positional-order mismatch,
-and dead code kept intentionally).
+single-platform runs, IPC response-file hygiene, and dead code kept intentionally).

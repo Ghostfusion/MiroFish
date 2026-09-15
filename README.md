@@ -109,7 +109,7 @@ Click the image to watch MiroFish's deep prediction of the lost ending based on 
 # Copy the example configuration file
 cp .env.example .env
 
-# Edit the .env file and fill in the required API keys
+# Edit the .env file: fill in the LLM key and the graph database settings
 ```
 
 **Required Environment Variables:**
@@ -122,10 +122,36 @@ LLM_API_KEY=your_api_key
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LLM_MODEL_NAME=qwen-plus
 
-# Zep Cloud Configuration
-# Free monthly quota is sufficient for simple usage: https://app.getzep.com/
-ZEP_API_KEY=your_zep_api_key
+# Local knowledge-graph storage (written in-process by graphiti_core)
+# neo4j: connect to a Neo4j instance (see "Start the graph database" below)
+# kuzu : embedded file database, no external service required
+GRAPH_BACKEND=neo4j
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=your_neo4j_password
+#KUZU_DB_PATH=./uploads/graph.kuzu
+
+# Embeddings: model/dimension used for the vectors written into the graph
+EMBEDDING_MODEL_NAME=text-embedding-3-small
+EMBEDDING_DIM=1024
 ```
+
+`.env.example` is the authoritative template: it lists every supported variable with safe
+placeholders.
+
+**Start the graph database (default `GRAPH_BACKEND=neo4j`):**
+
+```bash
+docker run -d --name mirofish-neo4j -p 7687:7687 -p 7474:7474 \
+  -e NEO4J_AUTH=neo4j/<the NEO4J_PASSWORD you set in .env> neo4j:5
+```
+
+MiroFish reaches it over Bolt (`NEO4J_URI`) and writes the whole knowledge graph there. A
+build finishes as soon as its episodes are stored — there is no remote ingestion to poll,
+so the graph is queryable the moment the build task reports success.
+
+To run without any database service, set `GRAPH_BACKEND=kuzu`: MiroFish then uses an
+embedded Kuzu file database at `KUZU_DB_PATH` (default `backend/uploads/graph.kuzu`).
 
 #### 2. Install Dependencies
 
@@ -175,6 +201,10 @@ docker compose up -d
 Reads `.env` from root directory by default, maps ports `3000 (frontend) / 5001 (backend)`
 
 > Mirror address for faster pulling is provided as comments in `docker-compose.yml`, replace if needed.
+
+> The container bundles no graph database. With the default `GRAPH_BACKEND=neo4j` it needs a
+> reachable Neo4j: point `NEO4J_URI` at one you run yourself, or switch to
+> `GRAPH_BACKEND=kuzu` so the graph is a file inside the mounted `backend/uploads` directory.
 
 ## 📬 Join the Conversation
 

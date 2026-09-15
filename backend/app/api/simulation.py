@@ -1,6 +1,6 @@
 """
 模拟相关API路由
-Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化）
+Step2: 图谱实体读取与过滤、OASIS模拟准备与运行（全程自动化）
 """
 
 import os
@@ -8,7 +8,7 @@ from flask import request, jsonify, send_file
 
 from . import simulation_bp
 from ..config import Config
-from ..services.zep_entity_reader import ZepEntityReader
+from ..services.graph_entity_reader import GraphEntityReader
 from ..services.oasis_profile_generator import OasisProfileGenerator
 from ..services.simulation_manager import (
     SimulationManager,
@@ -26,6 +26,28 @@ from ..utils.locale import t, get_locale, set_locale
 from ..models.project import ProjectManager
 
 logger = get_logger('mirofish.api.simulation')
+
+
+def _graph_config_error() -> str | None:
+    """
+    检查图谱后端配置是否可用
+
+    图谱改为进程内直连本地图数据库后，凭证来自本地配置：
+    neo4j 需要 NEO4J_PASSWORD，kuzu 需要 KUZU_DB_PATH。
+
+    Returns:
+        配置错误信息；配置可用时返回 None
+    """
+    backend = (Config.GRAPH_BACKEND or '').strip().lower()
+    if backend == 'neo4j':
+        if not Config.NEO4J_PASSWORD:
+            return t('api.graphNotConfigured')
+    elif backend == 'kuzu':
+        if not Config.KUZU_DB_PATH:
+            return t('api.graphNotConfigured')
+    else:
+        return t('api.graphNotConfigured')
+    return None
 
 
 def _get_default_platform(simulation_id: str) -> str:
@@ -115,10 +137,11 @@ def get_graph_entities(graph_id: str):
         enrich: 是否获取相关边信息（默认true）
     """
     try:
-        if not Config.ZEP_API_KEY:
+        graph_config_error = _graph_config_error()
+        if graph_config_error:
             return jsonify({
                 "success": False,
-                "error": t('api.zepApiKeyMissing')
+                "error": graph_config_error
             }), 500
         
         entity_types_str = request.args.get('entity_types', '')
@@ -127,7 +150,7 @@ def get_graph_entities(graph_id: str):
         
         logger.info(f"获取图谱实体: graph_id={graph_id}, entity_types={entity_types}, enrich={enrich}")
         
-        reader = ZepEntityReader()
+        reader = GraphEntityReader()
         result = reader.filter_defined_entities(
             graph_id=graph_id,
             defined_entity_types=entity_types,
@@ -151,13 +174,14 @@ def get_graph_entities(graph_id: str):
 def get_entity_detail(graph_id: str, entity_uuid: str):
     """获取单个实体的详细信息"""
     try:
-        if not Config.ZEP_API_KEY:
+        graph_config_error = _graph_config_error()
+        if graph_config_error:
             return jsonify({
                 "success": False,
-                "error": t('api.zepApiKeyMissing')
+                "error": graph_config_error
             }), 500
         
-        reader = ZepEntityReader()
+        reader = GraphEntityReader()
         entity = reader.get_entity_with_context(graph_id, entity_uuid)
         
         if not entity:
@@ -183,15 +207,16 @@ def get_entity_detail(graph_id: str, entity_uuid: str):
 def get_entities_by_type(graph_id: str, entity_type: str):
     """获取指定类型的所有实体"""
     try:
-        if not Config.ZEP_API_KEY:
+        graph_config_error = _graph_config_error()
+        if graph_config_error:
             return jsonify({
                 "success": False,
-                "error": t('api.zepApiKeyMissing')
+                "error": graph_config_error
             }), 500
         
         enrich = request.args.get('enrich', 'true').lower() == 'true'
         
-        reader = ZepEntityReader()
+        reader = GraphEntityReader()
         entities = reader.get_entities_by_type(
             graph_id=graph_id,
             entity_type=entity_type,
@@ -441,7 +466,7 @@ def prepare_simulation():
     
     步骤：
     1. 检查是否已有完成的准备工作
-    2. 从Zep图谱读取并过滤实体
+    2. 从图谱读取并过滤实体
     3. 为每个实体生成OASIS Agent Profile（带重试机制）
     4. LLM智能生成模拟配置（带重试机制）
     5. 保存配置文件和预设脚本
@@ -542,7 +567,7 @@ def prepare_simulation():
         # 这样前端在调用prepare后立即就能获取到预期Agent总数
         try:
             logger.info(f"同步获取实体数量: graph_id={state.graph_id}")
-            reader = ZepEntityReader()
+            reader = GraphEntityReader()
             # 快速读取实体（不需要边信息，只统计数量）
             filtered_preview = reader.filter_defined_entities(
                 graph_id=state.graph_id,
@@ -1493,7 +1518,7 @@ def generate_profiles():
         use_llm = data.get('use_llm', True)
         platform = data.get('platform', 'reddit')
         
-        reader = ZepEntityReader()
+        reader = GraphEntityReader()
         filtered = reader.filter_defined_entities(
             graph_id=graph_id,
             defined_entity_types=entity_types,
@@ -1558,7 +1583,7 @@ def start_simulation():
         - 不会清理配置文件（simulation_config.json）和 profile 文件
         - 适用于需要重新运行模拟的场景
 
-    注意：模拟不会把 Agent 活动写回 Zep 图谱（该能力已移除，见 CHANGELOG）。
+    注意：模拟不会把 Agent 活动写回图谱（该能力已移除，见 CHANGELOG）。
 
     返回：
         {

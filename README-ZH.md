@@ -109,7 +109,7 @@ MiroFish 致力于打造映射现实的群体智能镜像，通过捕捉个体�
 # 复制示例配置文件
 cp .env.example .env
 
-# 编辑 .env 文件，填入必要的 API 密钥
+# 编辑 .env 文件，填入大模型密钥与图数据库配置
 ```
 
 **必需的环境变量：**
@@ -122,10 +122,34 @@ LLM_API_KEY=your_api_key
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LLM_MODEL_NAME=qwen-plus
 
-# Zep Cloud 配置
-# 每月免费额度即可支撑简单使用：https://app.getzep.com/
-ZEP_API_KEY=your_zep_api_key
+# 本地图谱存储配置（由 graphiti_core 在进程内直接写入）
+# neo4j：连接一个 Neo4j 实例（见下方「启动图数据库」）
+# kuzu ：内嵌文件库，无需任何外部服务
+GRAPH_BACKEND=neo4j
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=your_neo4j_password
+#KUZU_DB_PATH=./uploads/graph.kuzu
+
+# 向量化配置：写入图数据库的向量必须与该模型/维度保持一致
+EMBEDDING_MODEL_NAME=text-embedding-3-small
+EMBEDDING_DIM=1024
 ```
+
+`.env.example` 是权威模板：所有受支持的变量都在里面有安全占位符示例。
+
+**启动图数据库（默认 `GRAPH_BACKEND=neo4j`）：**
+
+```bash
+docker run -d --name mirofish-neo4j -p 7687:7687 -p 7474:7474 \
+  -e NEO4J_AUTH=neo4j/<你在 .env 里设置的 NEO4J_PASSWORD> neo4j:5
+```
+
+MiroFish 通过 Bolt（`NEO4J_URI`）连接它，知识图谱全部写入这个本地库。构建任务在
+episode 写入完成时即可结束——没有远端摄取需要轮询，构建一成功图谱立刻可查。
+
+不想运行任何数据库服务时，把 `GRAPH_BACKEND` 设为 `kuzu`：MiroFish 会改用内嵌的
+Kuzu 文件库，路径为 `KUZU_DB_PATH`（默认 `backend/uploads/graph.kuzu`）。
 
 #### 2. 安装依赖
 
@@ -173,6 +197,10 @@ docker compose up -d
 ```
 
 默认会读取根目录下的 `.env`，并映射端口 `3000（前端）/5001（后端）`
+
+> 容器内没有图数据库。默认 `GRAPH_BACKEND=neo4j` 时需要一个可访问的 Neo4j：把 `NEO4J_URI`
+> 指向你自己启动的实例，或改用 `GRAPH_BACKEND=kuzu`，让图谱以文件形式落在挂载出来的
+> `backend/uploads` 目录里。
 
 > 在 `docker-compose.yml` 中已通过注释提供加速镜像地址，可按需替换
 

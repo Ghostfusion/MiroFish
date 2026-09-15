@@ -1,9 +1,9 @@
 """
 Report Agent服务
-使用LangChain + Zep实现ReACT模式的模拟报告生成
+使用LangChain + 图谱检索实现ReACT模式的模拟报告生成
 
 功能：
-1. 根据模拟需求和Zep图谱信息生成报告
+1. 根据模拟需求和图谱信息生成报告
 2. 先规划目录结构，然后分段生成
 3. 每段采用ReACT多轮思考与反思模式
 4. 支持与用户对话，在对话中自主调用检索工具
@@ -23,8 +23,8 @@ from ..utils.json_files import read_json, write_json_atomic
 from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
-from .zep_tools import (
-    ZepToolsService, 
+from .graph_tools import (
+    GraphToolsService, 
     SearchResult, 
     InsightForgeResult, 
     PanoramaResult,
@@ -355,7 +355,7 @@ class ReportConsoleLogger:
         # 添加到 report_agent 相关的 logger
         loggers_to_attach = [
             'mirofish.report_agent',
-            'mirofish.zep_tools',
+            'mirofish.graph_tools',
         ]
         
         for logger_name in loggers_to_attach:
@@ -371,7 +371,7 @@ class ReportConsoleLogger:
         if self._file_handler:
             loggers_to_detach = [
                 'mirofish.report_agent',
-                'mirofish.zep_tools',
+                'mirofish.graph_tools',
             ]
             
             for logger_name in loggers_to_detach:
@@ -894,7 +894,7 @@ class ReportAgent:
         simulation_id: str,
         simulation_requirement: str,
         llm_client: Optional[LLMClient] = None,
-        zep_tools: Optional[ZepToolsService] = None
+        graph_tools: Optional[GraphToolsService] = None
     ):
         """
         初始化Report Agent
@@ -904,14 +904,14 @@ class ReportAgent:
             simulation_id: 模拟ID
             simulation_requirement: 模拟需求描述
             llm_client: LLM客户端（可选）
-            zep_tools: Zep工具服务（可选）
+            graph_tools: 图谱工具服务（可选）
         """
         self.graph_id = graph_id
         self.simulation_id = simulation_id
         self.simulation_requirement = simulation_requirement
         
         self.llm = llm_client or LLMClient()
-        self.zep_tools = zep_tools or ZepToolsService()
+        self.graph_tools = graph_tools or GraphToolsService()
         
         # 工具定义
         self.tools = self._define_tools()
@@ -978,7 +978,7 @@ class ReportAgent:
             if tool_name == "insight_forge":
                 query = parameters.get("query", "")
                 ctx = parameters.get("report_context", "") or report_context
-                result = self.zep_tools.insight_forge(
+                result = self.graph_tools.insight_forge(
                     graph_id=self.graph_id,
                     query=query,
                     simulation_requirement=self.simulation_requirement,
@@ -992,7 +992,7 @@ class ReportAgent:
                 include_expired = parameters.get("include_expired", True)
                 if isinstance(include_expired, str):
                     include_expired = include_expired.lower() in ['true', '1', 'yes']
-                result = self.zep_tools.panorama_search(
+                result = self.graph_tools.panorama_search(
                     graph_id=self.graph_id,
                     query=query,
                     include_expired=include_expired
@@ -1005,7 +1005,7 @@ class ReportAgent:
                 limit = parameters.get("limit", 10)
                 if isinstance(limit, str):
                     limit = int(limit)
-                result = self.zep_tools.quick_search(
+                result = self.graph_tools.quick_search(
                     graph_id=self.graph_id,
                     query=query,
                     limit=limit
@@ -1020,7 +1020,7 @@ class ReportAgent:
                     max_agents = int(max_agents)
                 # 同时限制上下界：负值会让切片变成"取最后N个之外的全部"
                 max_agents = max(1, min(max_agents, 10))
-                result = self.zep_tools.interview_agents(
+                result = self.graph_tools.interview_agents(
                     simulation_id=self.simulation_id,
                     interview_requirement=interview_topic,
                     simulation_requirement=self.simulation_requirement,
@@ -1036,12 +1036,12 @@ class ReportAgent:
                 return self._execute_tool("quick_search", parameters, report_context)
             
             elif tool_name == "get_graph_statistics":
-                result = self.zep_tools.get_graph_statistics(self.graph_id)
+                result = self.graph_tools.get_graph_statistics(self.graph_id)
                 return json.dumps(result, ensure_ascii=False, indent=2)
             
             elif tool_name == "get_entity_summary":
                 entity_name = parameters.get("entity_name", "")
-                result = self.zep_tools.get_entity_summary(
+                result = self.graph_tools.get_entity_summary(
                     graph_id=self.graph_id,
                     entity_name=entity_name
                 )
@@ -1055,7 +1055,7 @@ class ReportAgent:
             
             elif tool_name == "get_entities_by_type":
                 entity_type = parameters.get("entity_type", "")
-                nodes = self.zep_tools.get_entities_by_type(
+                nodes = self.graph_tools.get_entities_by_type(
                     graph_id=self.graph_id,
                     entity_type=entity_type
                 )
@@ -1204,7 +1204,7 @@ class ReportAgent:
             progress_callback("planning", 0, t('progress.analyzingRequirements'))
         
         # 首先获取模拟上下文
-        context = self.zep_tools.get_simulation_context(
+        context = self.graph_tools.get_simulation_context(
             graph_id=self.graph_id,
             simulation_requirement=self.simulation_requirement
         )

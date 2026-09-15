@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Graph storage moved in-process (Zep Cloud removed)
+
+The knowledge graph is no longer a cloud service. MiroFish writes and reads it through an
+in-process `graphiti_core` client (`backend/app/utils/graph_client.py`) against a local graph
+database selected by `GRAPH_BACKEND`: `neo4j` (default, `bolt://localhost:7687`) or `kuzu`
+(embedded file database, no external service). `ZEP_API_KEY` / `ZEP_API_URL` are gone from
+`Config` and `.env.example`, and `EMBEDDING_MODEL_NAME` / `EMBEDDING_DIM` now decide the
+vectors stored in the graph. A Zep graph id is simply a `group_id`: every public service
+signature still takes `graph_id: str` and passes it straight through, so
+`GET /api/graph/data/<graph_id>`, the task results and the report-tool dicts
+(`SearchResult` / `FilteredEntities` / `PanoramaResult` / `InsightForgeResult`) are unchanged.
+
+- **The 600 s ingestion wait is deleted, not shortened.** Zep ingestion was asynchronous: a
+  build submitted a batch and polled it every 3 s against a `600` s deadline. `add_episode`
+  returns only after the episode and its nodes/edges are written, so the build worker now
+  completes synchronously — every batch id, `Project.zep_batch_id` /
+  `zep_batch_operation_id` field, resume path, `_wait_for_batch`, `_wait_for_episodes`,
+  `ZEP_INGESTION_WAIT_TIMEOUT_SECONDS` and `time.sleep` poll loop is gone.
+- **Zep-only modules deleted; the survivors renamed**: `utils/zep.py`, `utils/zep_paging.py`,
+  `services/zep_graph_memory_updater.py` and `scripts/validate_zep_cloud_integration.py` are
+  deleted, and `utils/zep_lifecycle.py` → `utils/graph_lifecycle.py`,
+  `services/zep_entity_reader.py` → `services/graph_entity_reader.py` (`ZepEntityReader` →
+  `GraphEntityReader`), `services/zep_tools.py` → `services/graph_tools.py`
+  (`ZepToolsService` → `GraphToolsService`). No alias or shim keeps an old name alive.
+- **Graph reads and writes fail loudly.** Search runs on graphiti's hybrid RRF inside
+  `search_edges` / `search_nodes` (the `reranker="cross_encoder"` knob and the local keyword
+  fallback are gone), not-found reads return `None`, and a transport/connection failure
+  raises instead of degrading into an empty result.
+- **Tests**: the six suites that pinned the Zep wire contract are deleted and the three
+  barrier/lifecycle suites renamed (`test_zep_graph_lifecycle.py` → `test_graph_lifecycle.py`,
+  `test_zep_report_barrier.py` → `test_graph_report_barrier.py`,
+  `test_zep_simulation_barrier.py` → `test_graph_simulation_barrier.py`). Run the suite with
+  the command in `AGENTS.md` section 2.
+- **Docs**: `README.md` / `README-ZH.md` / `AGENTS.md` document the graph settings
+  (`GRAPH_BACKEND`, `NEO4J_*`, optional `KUZU_DB_PATH`, `EMBEDDING_*`) instead of
+  `ZEP_API_KEY`, with `.env.example` named as the authoritative template, and
+  `docs/DESIGN.md` / `docs/USER_GUIDE.md` describe the local store and the synchronous build.
+- **Frontend** (`frontend/src`, `locales/zh.json`, `locales/en.json`): the eleven strings that
+  named Zep now speak of the local graph/graph memory — `step1.graphRagDesc`,
+  `api.graphNotConfigured`, `progress.creatingGraph` / `waitingGraphProcess` /
+  `graphProcessing` / `connectingGraph` / `graphSearchQuery`, `log.graphEntitiesFound`,
+  `console.graphToolsInitialized` / `graphSearchFallback`. Seven strings whose only callers
+  (the retry helper and the local-search fallback) were deleted go with them:
+  `console.graphSearchOp`, `console.graphRetryAttempt`, `console.graphAllRetriesFailed`,
+  `console.usingLocalSearch`, `console.localSearchComplete`, `console.localSearchFailed`,
+  `console.fetchNodeDetailOp`. Key parity between `zh` and `en` is preserved; no layout or
+  behaviour changed.
+
+Verification: `grep -rni zep frontend/src locales` finds nothing, and the same grep over
+`README.md README-ZH.md docs AGENTS.md` finds nothing (`CHANGELOG.md` keeps its historical
+mentions); `cd frontend && npm run build` exits 0 (691 modules, only the two pre-existing
+warnings). The backend suite is run once at integration time — see `AGENTS.md` section 2 for
+that command.
+
 ### Simulation activity write-back to Zep removed
 
 The simulation run path no longer writes agent activity into the Zep graph. This is a

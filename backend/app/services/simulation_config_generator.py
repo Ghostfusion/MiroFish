@@ -22,7 +22,7 @@ from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
 from ..utils.openai_chat_compat import create_chat_completion, extract_chat_completion_text
-from .zep_entity_reader import EntityNode, ZepEntityReader
+from .graph_entity_reader import EntityNode, GraphEntityReader
 
 logger = get_logger('mirofish.simulation_config')
 

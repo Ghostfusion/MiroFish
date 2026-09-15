@@ -17,7 +17,7 @@ from ..models.project import ProjectManager, ProjectStatus
 from ..models.task import TaskManager, TaskStatus
 from ..utils.logger import get_logger
 from ..utils.locale import t, get_locale, set_locale
-from ..utils.zep_lifecycle import (
+from ..utils.graph_lifecycle import (
     graph_lifecycle_lock,
     register_graph_reader,
     unregister_graph_reader,
@@ -1056,9 +1056,9 @@ def search_graph_tool():
                 "error": t('api.requireGraphIdAndQuery')
             }), 400
         
-        from ..services.zep_tools import ZepToolsService
+        from ..services.graph_tools import GraphToolsService
         
-        tools = ZepToolsService()
+        tools = GraphToolsService()
         result = tools.search_graph(
             graph_id=graph_id,
             query=query,
@@ -1099,9 +1099,9 @@ def get_graph_statistics_tool():
                 "error": t('api.requireGraphId')
             }), 400
         
-        from ..services.zep_tools import ZepToolsService
+        from ..services.graph_tools import GraphToolsService
         
-        tools = ZepToolsService()
+        tools = GraphToolsService()
         result = tools.get_graph_statistics(graph_id)
         
         return jsonify({

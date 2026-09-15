@@ -23,11 +23,11 @@
 | 需要的东西 | 说明 |
 | --- | --- |
 | 一台电脑 | Windows / macOS 都可以，建议 8GB 以上内存 |
-| 能上网 | 全程需要联网（模型和记忆图谱都在云端） |
-| 两个「钥匙」（API Key） | ① **大模型 Key**：推荐阿里云百炼的 `qwen-plus`（[开通地址](https://bailian.console.aliyun.com/)）② **Zep Cloud Key**：免费额度就够试用（[开通地址](https://app.getzep.com/)） |
+| 能上网 | 只有大模型需要联网；知识图谱和全部结果都存在你自己的电脑上 |
+| 一把「钥匙」+ 一个本地图数据库 | ① **大模型 Key**：推荐阿里云百炼的 `qwen-plus`（[开通地址](https://bailian.console.aliyun.com/)）② **图数据库**：默认用本机的 Neo4j（一条 docker 命令就能启动，见下文），也可以改用内嵌的 Kuzu，完全不需要外部服务 |
 | 一定的耐心 | 一次完整推演通常需要 10 分钟到 2 小时不等，取决于文档长度和轮次 |
 
-> 关于花费：两个平台都是「用多少付多少」。按官方说明，**一次常规模拟平均约 5 美元**（大模型 + Zep 用量），免费额度可以先跑很小的例子试试。
+> 关于花费：只有大模型服务是按量付费的。按官方说明，**一次常规模拟平均约 5 美元**（大模型用量），新用户的免费额度可以先跑很小的例子试试；图谱存在本机，不产生任何云端费用。
 
 如果不会申请 Key，可以把这份手册转给身边懂电脑的同事，或到项目主页开一个 Issue 求助。
 
@@ -45,14 +45,32 @@
 cp .env.example .env      # Windows 用 copy .env.example .env
 ```
 
-用记事本打开新建的 `.env`，把两个 Key 填进去（其余保持不动）：
+用记事本打开新建的 `.env`，把大模型 Key 和图数据库配置填进去（其余保持不动）：
 
 ```env
 LLM_API_KEY=你的大模型Key
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LLM_MODEL_NAME=qwen-plus
-ZEP_API_KEY=你的Zep Key
+
+# 本地图谱存储（默认 Neo4j）
+GRAPH_BACKEND=neo4j
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=你的Neo4j密码
+
+# 向量化配置
+EMBEDDING_MODEL_NAME=text-embedding-3-small
+EMBEDDING_DIM=1024
 ```
+
+再启动图数据库（默认 `GRAPH_BACKEND=neo4j` 时需要，复制到终端执行一次即可）：
+
+```bash
+docker run -d --name mirofish-neo4j -p 7687:7687 -p 7474:7474 -e NEO4J_AUTH=neo4j/你的Neo4j密码 neo4j:5
+```
+
+> 不想装 Docker、也不想装数据库？把 `.env` 里的 `GRAPH_BACKEND` 改成 `kuzu`，MiroFish 会用内嵌的
+> Kuzu 文件库（路径由 `KUZU_DB_PATH` 指定，默认 `backend/uploads/graph.kuzu`），不需要任何外部服务。
 
 然后执行：
 
@@ -72,6 +90,8 @@ docker compose up -d
 ```
 
 同样把 `.env` 放在项目根目录，然后打开 **http://localhost:3000**。
+
+> 容器里没有图数据库：默认配置下需要另起一个 Neo4j（命令见「方式 A」），或把 `GRAPH_BACKEND` 改成 `kuzu`。
 
 ### 界面语言
 
@@ -108,6 +128,8 @@ docker compose up -d
 界面左侧会实时画出这张图谱（实体节点、关系边），右下方日志里会滚动过程信息。
 
 - 大约需要 **1～5 分钟**。
+- 图谱直接写在你本机的图数据库里：每一段资料写好后立刻就能查到，构建结束就是真的结束，
+  不需要再等远端的「处理队列」。
 - 完成后会出现按钮「**进入环境搭建**」，点它继续。
 
 > 如果卡住不动，先看右下角日志里的提示；常见原因是 Key 填错或余额不足。
@@ -189,7 +211,8 @@ docker compose up -d
 
 | 现象 | 可能原因 | 怎么办 |
 | --- | --- | --- |
-| 启动后提示「配置错误」 | `.env` 里两个 Key 没填 | 检查 `LLM_API_KEY`、`ZEP_API_KEY` |
+| 启动后提示「配置错误」 | `.env` 里大模型 Key 或图数据库配置没填对 | 检查 `LLM_API_KEY`；用 Neo4j 时再检查 `GRAPH_BACKEND`、`NEO4J_URI`、`NEO4J_PASSWORD` |
+| 构建图谱时报连接失败 | 图数据库没启动、密码不对或端口被占用 | `docker ps` 确认 Neo4j 在运行并核对 `NEO4J_PASSWORD`；跑不动数据库就改用 `GRAPH_BACKEND=kuzu` |
 | 点「启动引擎」后一直转圈 | 文件太大 / 网络慢 / Key 无效 | 换小一点的文件；确认 Key 有额度；看终端里的报错 |
 | 图谱构建失败 | 文档内容太短或全是图片 | 换一份有正文文字的资料（扫描版 PDF 需要先做文字识别） |
 | 环境搭建一直不完成 | 需要生成的人设太多 | 等一会儿；或减少实体数量后重试 |
@@ -210,6 +233,7 @@ docker compose up -d
 | 模拟提示词 | 你写的推演需求 |
 | 本体 | 系统从资料里总结出的「有哪些类型的事物」 |
 | 知识图谱 | 人物/机构/事件之间的关系网，MiroFish 的长期记忆 |
+| 图数据库（Neo4j / Kuzu） | 知识图谱存放的地方：默认是跑在你电脑上的 Neo4j，也可以改用内嵌的 Kuzu 文件库 |
 | Agent（智能体/角色） | 平行世界里的一个「人」，有人设、记忆和行为习惯 |
 | 轮次 | 世界里的时间单位，1 轮 ≈ 现实世界的若干分钟 |
 | 世界1 / 世界2 | 两个不同风格的社交平台（信息流 / 话题社区） |
@@ -220,7 +244,8 @@ docker compose up -d
 
 ## 8. 数据与隐私（请务必看）
 
-- 你上传的文档内容会**发送给你配置的大模型服务商和 Zep Cloud**，用于生成图谱和报告；它不会上传到 MiroFish 项目组。
+- 你上传的文档内容只会**发送给你自己配置的大模型服务商**，用于生成图谱和报告；它不会上传到 MiroFish 项目组，也不会发送给任何图数据库云服务。
+- 知识图谱保存在你自己电脑上的图数据库里（Neo4j 实例，或 `backend/uploads/` 下的 Kuzu 文件）。
 - 因此**不要上传机密、违法或他人隐私资料**。
 - 所有结果保存在你自己电脑的 `backend/uploads/` 目录里（Git 不会保存它）。删掉这个目录就等于清空全部记录。
 - `.env`（含你的 Key）不要发给别人、不要上传到代码仓库。
@@ -244,7 +269,10 @@ docker compose up -d
 
 1. Install **Node.js 18+**, **Python 3.11–3.12** and **uv**.
 2. `cp .env.example .env`, then fill in `LLM_API_KEY` (any OpenAI-compatible endpoint,
-   e.g. Alibaba Bailian `qwen-plus`) and `ZEP_API_KEY` (Zep Cloud).
+   e.g. Alibaba Bailian `qwen-plus`) and the graph settings. With the default
+   `GRAPH_BACKEND=neo4j`, set `NEO4J_PASSWORD` and start the database:
+   `docker run -d --name mirofish-neo4j -p 7687:7687 -e NEO4J_AUTH=neo4j/<password> neo4j:5`;
+   or set `GRAPH_BACKEND=kuzu` to use an embedded file database and run no service at all.
 3. `npm run setup:all && npm run dev` (or `docker compose up -d`).
 4. Open **http://localhost:3000**, switch the language in the top-right corner.
 5. Follow the five steps: upload seed documents + a plain-language prediction question →
@@ -252,7 +280,9 @@ docker compose up -d
    run the simulation → generate the report → chat with the ReportAgent or any simulated
    agent.
 
-Costs: one typical simulation averages a few US dollars of LLM + Zep usage; both providers
-have free tiers for small experiments. Your documents are sent to those providers, so do not
-upload material you are not allowed to share. Reports and simulations are stored locally in
-`backend/uploads/`.
+Costs: one typical simulation averages a few US dollars of LLM usage; that provider's free
+tier covers small experiments. The graph lives in your own database (Neo4j or an embedded
+Kuzu file), so storage adds no cloud bill, and a build finishes as soon as its chunks are
+written — there is no remote ingestion queue to wait for. Your documents are sent to the LLM
+provider only, so do not upload material you are not allowed to share. Graphs, reports and
+simulations are stored locally (`backend/uploads/` and your graph database).

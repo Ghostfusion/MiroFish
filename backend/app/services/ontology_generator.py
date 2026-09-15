@@ -561,7 +561,7 @@ class OntologyGenerator:
             result["entity_types"] = others[:keep_slots] + fallbacks
 
         # Resolve edge endpoints only after entity fallback/capping, so an edge
-        # cannot refer to a type that was removed to satisfy Zep's limits.
+        # cannot refer to a type that was removed to satisfy MAX_ONTOLOGY_TYPES.
         valid_entity_names = {entity["name"] for entity in result["entity_types"]}
         for name in valid_entity_names:
             entity_name_map[name] = name
@@ -582,7 +582,7 @@ class OntologyGenerator:
         for raw_edge in raw_edges:
             if isinstance(raw_edge, str):
                 # A bare edge name has no endpoints and cannot be installed in
-                # Zep safely. Ignore it instead of inventing a relationship.
+                # the graph ontology safely. Ignore it instead of inventing a relationship.
                 logger.warning(f"Ignoring ontology edge without source_targets: {raw_edge}")
                 continue
             elif isinstance(raw_edge, dict):
@@ -653,8 +653,7 @@ class OntologyGenerator:
             '由MiroFish自动生成，用于社会舆论模拟',
             '"""',
             '',
-            'from pydantic import Field',
-            'from zep_cloud.external_clients.ontology import EntityModel, EntityText, EdgeModel',
+            'from pydantic import BaseModel, Field',
             '',
             '',
             '# ============== 实体类型定义 ==============',
@@ -666,7 +665,7 @@ class OntologyGenerator:
             name = entity["name"]
             desc = entity.get("description", f"A {name} entity.")
             
-            code_lines.append(f'class {name}(EntityModel):')
+            code_lines.append(f'class {name}(BaseModel):')
             code_lines.append(f'    """{desc}"""')
             
             attrs = entity.get("attributes", [])
@@ -674,7 +673,7 @@ class OntologyGenerator:
                 for attr in attrs:
                     attr_name = attr["name"]
                     attr_desc = attr.get("description", attr_name)
-                    code_lines.append(f'    {attr_name}: EntityText = Field(')
+                    code_lines.append(f'    {attr_name}: str | None = Field(')
                     code_lines.append(f'        description="{attr_desc}",')
                     code_lines.append(f'        default=None')
                     code_lines.append(f'    )')
@@ -694,7 +693,7 @@ class OntologyGenerator:
             class_name = ''.join(word.capitalize() for word in name.split('_'))
             desc = edge.get("description", f"A {name} relationship.")
             
-            code_lines.append(f'class {class_name}(EdgeModel):')
+            code_lines.append(f'class {class_name}(BaseModel):')
             code_lines.append(f'    """{desc}"""')
             
             attrs = edge.get("attributes", [])
@@ -702,7 +701,7 @@ class OntologyGenerator:
                 for attr in attrs:
                     attr_name = attr["name"]
                     attr_desc = attr.get("description", attr_name)
-                    code_lines.append(f'    {attr_name}: EntityText = Field(')
+                    code_lines.append(f'    {attr_name}: str | None = Field(')
                     code_lines.append(f'        description="{attr_desc}",')
                     code_lines.append(f'        default=None')
                     code_lines.append(f'    )')
