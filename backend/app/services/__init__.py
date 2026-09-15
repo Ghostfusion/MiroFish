@@ -25,7 +25,6 @@ from .simulation_runner import (
 )
 from .zep_graph_memory_updater import (
     ZepGraphMemoryUpdater,
-    ZepGraphMemoryManager,
     AgentActivity
 )
 from .simulation_ipc import (
@@ -61,7 +60,6 @@ __all__ = [
     'AgentAction',
     'RoundSummary',
     'ZepGraphMemoryUpdater',
-    'ZepGraphMemoryManager',
     'AgentActivity',
     'SimulationIPCClient',
     'SimulationIPCServer',

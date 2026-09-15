@@ -5,7 +5,6 @@ from flask import Flask
 from types import SimpleNamespace
 
 from app.api import graph as graph_api
-from app.api import simulation as simulation_api
 from app.models.project import Project, ProjectStatus
 from app.services.simulation_manager import SimulationStatus
 from app.models.task import TaskStatus
@@ -72,6 +71,11 @@ def test_project_reset_deletes_the_cloud_graph_before_clearing_reference(monkeyp
 
 def test_project_reset_refuses_a_graph_with_an_active_simulation(monkeypatch):
     project = _project(ProjectStatus.GRAPH_COMPLETED)
+    simulation = SimpleNamespace(
+        simulation_id="sim-active",
+        graph_id=project.graph_id,
+        status=SimulationStatus.RUNNING,
+    )
     monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
     monkeypatch.setattr(
         graph_api.ProjectManager,
@@ -79,9 +83,18 @@ def test_project_reset_refuses_a_graph_with_an_active_simulation(monkeypatch):
         classmethod(lambda _cls, _project_id: project),
     )
     monkeypatch.setattr(
-        graph_api.ZepGraphMemoryManager,
-        "get_simulation_ids_for_graph",
-        classmethod(lambda _cls, _graph_id: ["sim-active"]),
+        graph_api,
+        "SimulationManager",
+        lambda: SimpleNamespace(list_simulations=lambda: [simulation]),
+    )
+    monkeypatch.setattr(
+        graph_api.SimulationRunner,
+        "get_run_state",
+        classmethod(
+            lambda _cls, _simulation_id: SimpleNamespace(
+                runner_status=graph_api.RunnerStatus.RUNNING
+            )
+        ),
     )
 
     app = Flask(__name__)
@@ -90,30 +103,6 @@ def test_project_reset_refuses_a_graph_with_an_active_simulation(monkeypatch):
 
     assert status == 409
     assert "sim-active" in body["error"]
-
-
-def test_graph_delete_cannot_discard_an_updater_during_finalization(monkeypatch):
-    monkeypatch.setattr(
-        graph_api.ZepGraphMemoryManager,
-        "get_simulation_ids_for_graph",
-        classmethod(lambda _cls, _graph_id: ["sim-finalizing"]),
-    )
-    discarded = []
-    monkeypatch.setattr(
-        graph_api.ZepGraphMemoryManager,
-        "discard_inactive_updater",
-        classmethod(
-            lambda _cls, simulation_id: discarded.append(simulation_id)
-        ),
-    )
-    lock = graph_api.SimulationRunner._finalization_lock("sim-finalizing")
-    lock.acquire()
-    try:
-        assert graph_api._active_graph_consumers("graph-1") == ["sim-finalizing"]
-    finally:
-        lock.release()
-
-    assert discarded == []
 
 
 def test_repeated_build_request_reuses_the_existing_task(monkeypatch):
@@ -326,93 +315,3 @@ def test_force_must_be_a_json_boolean(monkeypatch):
 
     assert status == 400
     assert "boolean" in body["error"]
-
-
-def test_graph_reset_and_memory_start_cannot_cross_between_delete_and_clear(
-    monkeypatch,
-):
-    project = _project(ProjectStatus.GRAPH_COMPLETED)
-    simulation = SimpleNamespace(
-        simulation_id="sim-1",
-        project_id=project.project_id,
-        graph_id=project.graph_id,
-        status=SimulationStatus.READY,
-    )
-    delete_entered = threading.Event()
-    allow_delete = threading.Event()
-    runner_called = []
-
-    class Builder:
-        def __init__(self, **_kwargs):
-            pass
-
-        def delete_graph(self, graph_id):
-            assert graph_id == "graph-1"
-            delete_entered.set()
-            assert allow_delete.wait(timeout=2)
-
-    class Simulations:
-        def get_simulation(self, _simulation_id):
-            return simulation
-
-    monkeypatch.setattr(graph_api, "GraphBuilderService", Builder)
-    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
-    monkeypatch.setattr(
-        graph_api.ProjectManager,
-        "get_project",
-        classmethod(lambda _cls, _project_id: project),
-    )
-    monkeypatch.setattr(
-        graph_api.ProjectManager,
-        "save_project",
-        classmethod(lambda _cls, _project: None),
-    )
-    monkeypatch.setattr(simulation_api, "SimulationManager", Simulations)
-    monkeypatch.setattr(
-        simulation_api.ProjectManager,
-        "get_project",
-        classmethod(lambda _cls, _project_id: project),
-    )
-    monkeypatch.setattr(
-        simulation_api.SimulationRunner,
-        "start_simulation",
-        classmethod(lambda _cls, **_kwargs: runner_called.append(True)),
-    )
-
-    app = Flask(__name__)
-    results = {}
-
-    def reset():
-        with app.test_request_context(
-            "/api/graph/project/proj-1/reset", method="POST"
-        ):
-            results["reset"] = _json_result(graph_api.reset_project("proj-1"))
-
-    def start():
-        with app.test_request_context(
-            "/api/simulation/start",
-            method="POST",
-            json={
-                "simulation_id": "sim-1",
-                "enable_graph_memory_update": True,
-            },
-        ):
-            results["start"] = _json_result(simulation_api.start_simulation())
-
-    reset_thread = threading.Thread(target=reset)
-    reset_thread.start()
-    assert delete_entered.wait(timeout=2)
-
-    start_thread = threading.Thread(target=start)
-    start_thread.start()
-    start_thread.join(timeout=0.05)
-    assert start_thread.is_alive()
-
-    allow_delete.set()
-    reset_thread.join(timeout=2)
-    start_thread.join(timeout=2)
-
-    assert results["reset"][1] == 200
-    assert results["start"][1] == 409
-    assert runner_called == []
-    assert project.graph_id is None

@@ -4,7 +4,6 @@ Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化�
 """
 
 import os
-from contextlib import nullcontext
 from flask import request, jsonify, send_file
 
 from . import simulation_bp
@@ -21,11 +20,9 @@ from ..services.simulation_runner import (
     RunnerStatus,
     SimulationStopPending,
 )
-from ..services.zep_graph_memory_updater import ZepGraphMemoryManager
 from ..utils.json_files import read_json, write_json_atomic
 from ..utils.logger import get_logger
 from ..utils.locale import t, get_locale, set_locale
-from ..utils.zep_lifecycle import get_graph_readers, graph_lifecycle_lock
 from ..models.project import ProjectManager
 
 logger = get_logger('mirofish.api.simulation')
@@ -1552,7 +1549,6 @@ def start_simulation():
             "simulation_id": "sim_xxxx",          // 必填，模拟ID
             "platform": "parallel",                // 可选: twitter / reddit / parallel (默认)
             "max_rounds": 100,                     // 可选: 最大模拟轮数，用于截断过长的模拟
-            "enable_graph_memory_update": false,   // 可选: 是否将Agent活动动态更新到Zep图谱记忆
             "force": false                         // 可选: 强制重新开始（会停止运行中的模拟并清理日志）
         }
 
@@ -1562,11 +1558,7 @@ def start_simulation():
         - 不会清理配置文件（simulation_config.json）和 profile 文件
         - 适用于需要重新运行模拟的场景
 
-    关于 enable_graph_memory_update：
-        - 启用后，模拟中所有Agent的活动（发帖、评论、点赞等）都会实时更新到Zep图谱
-        - 这可以让图谱"记住"模拟过程，用于后续分析或AI对话
-        - 需要模拟关联的项目有有效的 graph_id
-        - 采用批量更新机制，减少API调用次数
+    注意：模拟不会把 Agent 活动写回 Zep 图谱（该能力已移除，见 CHANGELOG）。
 
     返回：
         {
@@ -1578,7 +1570,6 @@ def start_simulation():
                 "twitter_running": true,
                 "reddit_running": true,
                 "started_at": "2025-12-01T10:00:00",
-                "graph_memory_update_enabled": true,  // 是否启用了图谱记忆更新
                 "force_restarted": true               // 是否是强制重新开始
             }
         }
@@ -1595,13 +1586,7 @@ def start_simulation():
 
         platform = data.get('platform', 'parallel')
         max_rounds = data.get('max_rounds')  # 可选：最大模拟轮数
-        enable_graph_memory_update = data.get('enable_graph_memory_update', False)  # 可选：是否启用图谱记忆更新
         force = data.get('force', False)  # 可选：强制重新开始
-        if not isinstance(enable_graph_memory_update, bool):
-            return jsonify({
-                "success": False,
-                "error": "enable_graph_memory_update must be a JSON boolean",
-            }), 400
         if not isinstance(force, bool):
             return jsonify({
                 "success": False,
@@ -1648,24 +1633,13 @@ def start_simulation():
 
             if is_prepared:
                 run_state = SimulationRunner.get_run_state(simulation_id)
-                updater = ZepGraphMemoryManager.get_updater(simulation_id)
                 needs_finalization = bool(
                     run_state
                     and run_state.runner_status in {
                         RunnerStatus.RUNNING,
                         RunnerStatus.PAUSED,
                         RunnerStatus.STOPPING,
-                        RunnerStatus.FAILED,
                     }
-                    and (
-                        run_state.runner_status
-                        in {
-                            RunnerStatus.RUNNING,
-                            RunnerStatus.PAUSED,
-                            RunnerStatus.STOPPING,
-                        }
-                        or updater is not None
-                    )
                 )
                 if needs_finalization:
                     if not force:
@@ -1721,94 +1695,17 @@ def start_simulation():
                     "error": t('api.simNotReady', status=state.status.value)
                 }), 400
         
-        # 获取图谱ID（用于图谱记忆更新）
-        graph_id = None
-        if enable_graph_memory_update:
-            # The project is authoritative. A graph ID copied into an older
-            # simulation can outlive a project reset/rebuild and must not be
-            # used to resurrect writes to a deleted graph.
-            project = ProjectManager.get_project(state.project_id)
-            graph_id = project.graph_id if project else None
-            if not graph_id:
-                return jsonify({
-                    "success": False,
-                    "error": t('api.graphIdRequiredForMemory')
-                }), 400
-
-        graph_guard = (
-            graph_lifecycle_lock(graph_id)
-            if enable_graph_memory_update
-            else nullcontext()
+        # 启动模拟
+        run_state = SimulationRunner.start_simulation(
+            simulation_id=simulation_id,
+            platform=platform,
+            max_rounds=max_rounds,
         )
-        with graph_guard:
-            if enable_graph_memory_update:
-                # Re-read both references under the same per-graph lock used
-                # by reset/delete. Keep the lock through updater creation in
-                # start_simulation so check -> claim is atomic.
-                refreshed_state = manager.get_simulation(simulation_id)
-                refreshed_project = (
-                    ProjectManager.get_project(refreshed_state.project_id)
-                    if refreshed_state
-                    else None
-                )
-                current_graph_id = (
-                    refreshed_project.graph_id if refreshed_project else None
-                )
-                if current_graph_id != graph_id:
-                    return jsonify({
-                        "success": False,
-                        "error": (
-                            "The project graph changed while the simulation "
-                            "was starting; retry after refreshing the project"
-                        ),
-                    }), 409
-                if (
-                    refreshed_state.graph_id
-                    and refreshed_state.graph_id != current_graph_id
-                ):
-                    return jsonify({
-                        "success": False,
-                        "error": (
-                            "The simulation references an older graph; "
-                            "prepare it again before enabling graph memory"
-                        ),
-                    }), 409
-                active_reports = get_graph_readers(graph_id)
-                if active_reports:
-                    return jsonify({
-                        "success": False,
-                        "error": (
-                            "A report is currently reading this graph; wait "
-                            "for report generation to finish before enabling "
-                            "graph memory updates"
-                        ),
-                        "active_reports": active_reports,
-                    }), 409
-                state = refreshed_state
-                logger.info(
-                    "启用图谱记忆更新: simulation_id=%s, graph_id=%s",
-                    simulation_id,
-                    graph_id,
-                )
 
-            # 启动模拟。启用图谱写入时仍持有 graph_guard，直到 updater
-            # claim 与进程资源全部发布完成。
-            run_state = SimulationRunner.start_simulation(
-                simulation_id=simulation_id,
-                platform=platform,
-                max_rounds=max_rounds,
-                enable_graph_memory_update=enable_graph_memory_update,
-                graph_id=graph_id
-            )
-        
         response_data = run_state.to_dict()
         if max_rounds:
             response_data['max_rounds_applied'] = max_rounds
-        response_data['graph_memory_update_enabled'] = enable_graph_memory_update
         response_data['force_restarted'] = force_restarted
-        if enable_graph_memory_update:
-            response_data['graph_id'] = graph_id
-        
         return jsonify({
             "success": True,
             "data": response_data

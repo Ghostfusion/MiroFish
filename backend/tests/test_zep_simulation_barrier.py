@@ -15,46 +15,6 @@ from app.services.simulation_runner import (
 )
 
 
-def test_manual_stop_surfaces_graph_ingestion_failure(monkeypatch):
-    state = SimulationRunState(
-        simulation_id="sim-1",
-        runner_status=RunnerStatus.RUNNING,
-    )
-    saved = []
-    monkeypatch.setattr(
-        SimulationRunner,
-        "get_run_state",
-        classmethod(lambda _cls, _simulation_id: state),
-    )
-    monkeypatch.setattr(
-        SimulationRunner,
-        "_save_run_state",
-        classmethod(lambda _cls, value: saved.append(value.runner_status)),
-    )
-    monkeypatch.setattr(
-        runner_module.ZepGraphMemoryManager,
-        "stop_updater",
-        classmethod(
-            lambda _cls, _simulation_id: (_ for _ in ()).throw(
-                RuntimeError("ingestion incomplete")
-            )
-        ),
-    )
-    SimulationRunner._processes.pop("sim-1", None)
-    SimulationRunner._graph_memory_enabled["sim-1"] = True
-
-    try:
-        with pytest.raises(RuntimeError, match="ingestion incomplete"):
-            SimulationRunner.stop_simulation("sim-1")
-
-        assert state.runner_status == RunnerStatus.FAILED
-        assert "ingestion incomplete" in state.error
-        assert saved[-1] == RunnerStatus.FAILED
-    finally:
-        SimulationRunner._graph_memory_enabled.pop("sim-1", None)
-        SimulationRunner._manual_stop_requests.discard("sim-1")
-
-
 def test_platform_completion_does_not_publish_terminal_success_before_barrier(
     monkeypatch, tmp_path
 ):
@@ -104,7 +64,6 @@ def test_manual_stop_timeout_leaves_monitor_owned_state_stopping(monkeypatch):
     )
     SimulationRunner._monitor_threads["sim-timeout"] = Monitor()
     SimulationRunner._processes.pop("sim-timeout", None)
-    SimulationRunner._graph_memory_enabled.pop("sim-timeout", None)
 
     try:
         with pytest.raises(TimeoutError, match="仍在停止中"):
@@ -113,44 +72,6 @@ def test_manual_stop_timeout_leaves_monitor_owned_state_stopping(monkeypatch):
     finally:
         SimulationRunner._monitor_threads.pop("sim-timeout", None)
         SimulationRunner._manual_stop_requests.discard("sim-timeout")
-
-
-def test_failed_ingestion_finalization_can_be_retried(monkeypatch):
-    state = SimulationRunState(
-        simulation_id="sim-retry",
-        runner_status=RunnerStatus.FAILED,
-        error="first drain timed out",
-    )
-    monkeypatch.setattr(
-        SimulationRunner,
-        "get_run_state",
-        classmethod(lambda _cls, _simulation_id: state),
-    )
-    monkeypatch.setattr(
-        SimulationRunner,
-        "_save_run_state",
-        classmethod(lambda _cls, _state: None),
-    )
-    monkeypatch.setattr(
-        runner_module.ZepGraphMemoryManager,
-        "get_updater",
-        classmethod(lambda _cls, _simulation_id: object()),
-    )
-    monkeypatch.setattr(
-        runner_module.ZepGraphMemoryManager,
-        "stop_updater",
-        classmethod(lambda _cls, _simulation_id: None),
-    )
-    SimulationRunner._graph_memory_enabled["sim-retry"] = True
-    SimulationRunner._monitor_threads.pop("sim-retry", None)
-
-    try:
-        result = SimulationRunner.stop_simulation("sim-retry")
-        assert result.runner_status == RunnerStatus.STOPPED
-        assert result.error is None
-    finally:
-        SimulationRunner._graph_memory_enabled.pop("sim-retry", None)
-        SimulationRunner._manual_stop_requests.discard("sim-retry")
 
 
 def test_stop_api_keeps_pending_finalization_out_of_failed_state(monkeypatch):
@@ -188,16 +109,12 @@ def test_stop_api_keeps_pending_finalization_out_of_failed_state(monkeypatch):
     assert saved == []
 
 
-@pytest.mark.parametrize(
-    "field",
-    ["force", "enable_graph_memory_update"],
-)
-def test_simulation_start_rejects_string_booleans(field):
+def test_simulation_start_rejects_string_booleans():
     app = Flask(__name__)
     with app.test_request_context(
         "/api/simulation/start",
         method="POST",
-        json={"simulation_id": "sim-1", field: "false"},
+        json={"simulation_id": "sim-1", "force": "false"},
     ):
         response, status = simulation_api.start_simulation()
 
@@ -205,7 +122,7 @@ def test_simulation_start_rejects_string_booleans(field):
     assert "JSON boolean" in response.get_json()["error"]
 
 
-def test_force_restart_does_not_continue_while_old_ingestion_is_pending(monkeypatch):
+def test_force_restart_does_not_continue_while_the_previous_run_is_finalizing(monkeypatch):
     simulation = SimpleNamespace(
         simulation_id="sim-1",
         project_id="proj-1",
@@ -251,12 +168,6 @@ def test_force_restart_does_not_continue_while_old_ingestion_is_pending(monkeypa
             lambda _cls, _simulation_id: cleanup_called.append(True)
         ),
     )
-    monkeypatch.setattr(
-        simulation_api.ZepGraphMemoryManager,
-        "get_updater",
-        classmethod(lambda _cls, _simulation_id: object()),
-    )
-
     app = Flask(__name__)
     with app.test_request_context(
         "/api/simulation/start",
@@ -321,7 +232,6 @@ def test_monitor_start_failure_terminates_the_spawned_process(monkeypatch, tmp_p
             SimulationRunner.start_simulation(
                 simulation_id,
                 platform="twitter",
-                enable_graph_memory_update=False,
             )
         assert terminated == [simulation_id]
         assert simulation_id not in SimulationRunner._processes
@@ -333,12 +243,9 @@ def test_monitor_start_failure_terminates_the_spawned_process(monkeypatch, tmp_p
         SimulationRunner._action_queues.pop(simulation_id, None)
         SimulationRunner._stdout_files.pop(simulation_id, None)
         SimulationRunner._stderr_files.pop(simulation_id, None)
-        SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
 
 
-def test_shutdown_terminates_producer_before_tail_read_and_updater_drain(
-    monkeypatch,
-):
+def test_shutdown_terminates_producer_before_tail_read(monkeypatch):
     simulation_id = "sim-shutdown-order"
     state = SimulationRunState(
         simulation_id=simulation_id,
@@ -360,9 +267,8 @@ def test_shutdown_terminates_producer_before_tail_read_and_updater_drain(
 
         def join(self, timeout):
             assert timeout >= 30
-            events.extend(["tail-read", "updater-drain"])
+            events.append("tail-read")
             state.runner_status = RunnerStatus.STOPPED
-            SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
             self.alive = False
 
         def is_alive(self):
@@ -393,92 +299,16 @@ def test_shutdown_terminates_producer_before_tail_read_and_updater_drain(
             )
         ),
     )
-    monkeypatch.setattr(
-        runner_module.ZepGraphMemoryManager,
-        "get_simulation_ids",
-        classmethod(lambda _cls: [simulation_id]),
-    )
-    updater = object()
-    monkeypatch.setattr(
-        runner_module.ZepGraphMemoryManager,
-        "get_updater",
-        classmethod(lambda _cls, _simulation_id: updater),
-    )
 
     SimulationRunner._cleanup_done = False
     SimulationRunner._processes[simulation_id] = process
     SimulationRunner._monitor_threads[simulation_id] = Monitor()
-    SimulationRunner._graph_memory_enabled[simulation_id] = True
     try:
         SimulationRunner.cleanup_all_simulations()
-        assert events == [
-            "producer-terminate",
-            "tail-read",
-            "updater-drain",
-        ]
+        assert events == ["producer-terminate", "tail-read"]
         assert state.runner_status == RunnerStatus.STOPPED
     finally:
         SimulationRunner._cleanup_done = False
         SimulationRunner._processes.pop(simulation_id, None)
         SimulationRunner._monitor_threads.pop(simulation_id, None)
-        SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
-        SimulationRunner._manual_stop_requests.discard(simulation_id)
-
-
-def test_shutdown_drain_failure_remains_failed_and_retryable(monkeypatch):
-    simulation_id = "sim-shutdown-failure"
-    state = SimulationRunState(
-        simulation_id=simulation_id,
-        runner_status=RunnerStatus.RUNNING,
-    )
-    updater = object()
-
-    monkeypatch.setattr(
-        SimulationRunner,
-        "get_run_state",
-        classmethod(lambda _cls, _simulation_id: state),
-    )
-    monkeypatch.setattr(
-        SimulationRunner,
-        "_save_run_state",
-        classmethod(lambda _cls, _state: None),
-    )
-    monkeypatch.setattr(
-        SimulationRunner,
-        "_sync_simulation_status",
-        classmethod(lambda _cls, *_args, **_kwargs: None),
-    )
-    monkeypatch.setattr(
-        runner_module.ZepGraphMemoryManager,
-        "get_simulation_ids",
-        classmethod(lambda _cls: [simulation_id]),
-    )
-    monkeypatch.setattr(
-        runner_module.ZepGraphMemoryManager,
-        "get_updater",
-        classmethod(lambda _cls, _simulation_id: updater),
-    )
-    monkeypatch.setattr(
-        runner_module.ZepGraphMemoryManager,
-        "stop_updater",
-        classmethod(
-            lambda _cls, _simulation_id: (_ for _ in ()).throw(
-                RuntimeError("drain incomplete")
-            )
-        ),
-    )
-
-    SimulationRunner._cleanup_done = False
-    SimulationRunner._graph_memory_enabled[simulation_id] = True
-    SimulationRunner._monitor_threads.pop(simulation_id, None)
-    SimulationRunner._processes.pop(simulation_id, None)
-    try:
-        SimulationRunner.cleanup_all_simulations()
-        assert state.runner_status == RunnerStatus.FAILED
-        assert "drain incomplete" in state.error
-        assert SimulationRunner._graph_memory_enabled[simulation_id] is True
-        assert SimulationRunner._cleanup_done is False
-    finally:
-        SimulationRunner._cleanup_done = False
-        SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
         SimulationRunner._manual_stop_requests.discard(simulation_id)

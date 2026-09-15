@@ -13,7 +13,6 @@ from ..config import Config
 from ..services.report_agent import ReportAgent, ReportManager, ReportStatus
 from ..services.simulation_manager import SimulationManager
 from ..services.simulation_runner import SimulationRunner, RunnerStatus
-from ..services.zep_graph_memory_updater import ZepGraphMemoryManager
 from ..models.project import ProjectManager, ProjectStatus
 from ..models.task import TaskManager, TaskStatus
 from ..utils.logger import get_logger
@@ -82,23 +81,19 @@ def generate_report():
             }), 404
 
         run_state = SimulationRunner.get_run_state(simulation_id)
-        updater = ZepGraphMemoryManager.get_updater(simulation_id)
         active_statuses = {
             RunnerStatus.STARTING,
             RunnerStatus.RUNNING,
             RunnerStatus.PAUSED,
             RunnerStatus.STOPPING,
         }
-        if updater is not None or (
-            run_state is not None and run_state.runner_status in active_statuses
-        ):
+        if run_state is not None and run_state.runner_status in active_statuses:
             return jsonify({
                 "success": False,
                 "error": (
-                    "Simulation or Zep graph ingestion is still active; "
-                    "wait for a terminal run status before generating a report"
+                    "The simulation is still active; wait for a terminal "
+                    "run status before generating a report"
                 ),
-                "ingestion_pending": updater is not None,
             }), 409
         successful_terminal_statuses = {
             RunnerStatus.COMPLETED,
@@ -157,9 +152,9 @@ def generate_report():
         report_id = f"report_{uuid.uuid4().hex[:12]}"
         
         # Register the background report as a graph reader under the same lock
-        # used by graph deletion and updater startup. A lock itself cannot be
-        # acquired in this request thread and released by the worker, so the
-        # durable reader registration is the cross-thread lease.
+        # used by graph deletion. A lock itself cannot be acquired in this
+        # request thread and released by the worker, so the durable reader
+        # registration is the cross-thread lease.
         with graph_lifecycle_lock(graph_id):
             refreshed_state = manager.get_simulation(simulation_id)
             refreshed_project = (
@@ -168,7 +163,6 @@ def generate_report():
                 else None
             )
             refreshed_run_state = SimulationRunner.get_run_state(simulation_id)
-            refreshed_updater = ZepGraphMemoryManager.get_updater(simulation_id)
             if (
                 refreshed_state is None
                 or refreshed_project is None
@@ -183,17 +177,16 @@ def generate_report():
                     "success": False,
                     "error": "The project graph changed while reporting was starting",
                 }), 409
-            if refreshed_updater is not None or (
+            if (
                 refreshed_run_state is not None
                 and refreshed_run_state.runner_status in active_statuses
             ):
                 return jsonify({
                     "success": False,
                     "error": (
-                        "Simulation or Zep graph ingestion became active; "
-                        "retry after it reaches a terminal state"
+                        "The simulation became active; retry after it reaches "
+                        "a terminal state"
                     ),
-                    "ingestion_pending": refreshed_updater is not None,
                 }), 409
             if (
                 refreshed_run_state is None

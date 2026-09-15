@@ -80,7 +80,7 @@ export const listSimulations = (projectId) => {
 
 /**
  * 启动模拟
- * @param {Object} data - { simulation_id, platform?, max_rounds?, enable_graph_memory_update? }
+ * @param {Object} data - { simulation_id, platform?, max_rounds?, force? }
  */
 export const startSimulation = (data) => {
   return service.post('/api/simulation/start', data)

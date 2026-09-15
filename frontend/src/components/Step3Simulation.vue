@@ -398,16 +398,13 @@ const doStartSimulation = async () => {
     const params = {
       simulation_id: props.simulationId,
       platform: 'parallel',
-      force: true,  // 强制重新开始
-      enable_graph_memory_update: true  // 开启动态图谱更新
+      force: true  // 强制重新开始
     }
     
     if (props.maxRounds) {
       params.max_rounds = props.maxRounds
       addLog(t('log.setMaxRounds', { rounds: props.maxRounds }))
     }
-    
-    addLog(t('log.graphMemoryUpdateEnabled'))
     
     const res = await startSimulation(params)
     

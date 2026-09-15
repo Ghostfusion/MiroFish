@@ -215,3 +215,74 @@ def test_atomic_json_write_is_never_observed_truncated(tmp_path):
     assert errors == []
     assert [item.name for item in tmp_path.iterdir()] == ["state.json"]
     assert json.loads(path.read_text(encoding="utf-8"))["value"] == 299
+
+class _FinishedProcess:
+    """Minimal Popen stand-in that has already exited."""
+
+    returncode = 0
+
+    def poll(self):
+        return 0
+
+
+def _run_monitor_for_terminal_state(tmp_path, monkeypatch, simulation_id):
+    monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        SimulationRunner,
+        "_sync_simulation_status",
+        classmethod(lambda _cls, *_args, **_kwargs: None),
+    )
+    state = SimulationRunState(
+        simulation_id=simulation_id, runner_status=RunnerStatus.RUNNING
+    )
+    monkeypatch.setattr(
+        SimulationRunner,
+        "get_run_state",
+        classmethod(lambda _cls, _simulation_id: state),
+    )
+    saved = []
+    monkeypatch.setattr(
+        SimulationRunner,
+        "_save_run_state",
+        classmethod(lambda _cls, value: saved.append(value.runner_status)),
+    )
+    (tmp_path / simulation_id).mkdir(parents=True, exist_ok=True)
+    SimulationRunner._processes[simulation_id] = _FinishedProcess()
+    SimulationRunner._stdout_files.pop(simulation_id, None)
+    SimulationRunner._stderr_files.pop(simulation_id, None)
+    return state, saved
+
+
+def test_monitor_publishes_completed_for_a_clean_exit(tmp_path, monkeypatch):
+    simulation_id = "sim-monitor-complete"
+    state, saved = _run_monitor_for_terminal_state(
+        tmp_path, monkeypatch, simulation_id
+    )
+    try:
+        SimulationRunner._monitor_simulation(simulation_id)
+
+        assert state.runner_status == RunnerStatus.COMPLETED
+        assert saved[-1] == RunnerStatus.COMPLETED
+        assert state.completed_at is not None
+    finally:
+        SimulationRunner._processes.pop(simulation_id, None)
+        SimulationRunner._monitor_threads.pop(simulation_id, None)
+        SimulationRunner._manual_stop_requests.discard(simulation_id)
+
+
+def test_monitor_publishes_stopped_for_a_manual_stop(tmp_path, monkeypatch):
+    simulation_id = "sim-monitor-stopped"
+    state, saved = _run_monitor_for_terminal_state(
+        tmp_path, monkeypatch, simulation_id
+    )
+    SimulationRunner._manual_stop_requests.add(simulation_id)
+    try:
+        SimulationRunner._monitor_simulation(simulation_id)
+
+        assert state.runner_status == RunnerStatus.STOPPED
+        assert saved[-1] == RunnerStatus.STOPPED
+        assert state.error is None
+    finally:
+        SimulationRunner._processes.pop(simulation_id, None)
+        SimulationRunner._monitor_threads.pop(simulation_id, None)
+        SimulationRunner._manual_stop_requests.discard(simulation_id)

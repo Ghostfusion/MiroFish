@@ -7,7 +7,6 @@ import pytest
 from app.services import zep_graph_memory_updater as updater_module
 from app.services.zep_graph_memory_updater import (
     AgentActivity,
-    ZepGraphMemoryManager,
     ZepGraphMemoryUpdater,
 )
 
@@ -193,20 +192,6 @@ def test_pending_episode_wait_has_a_deadline(monkeypatch):
 
     with pytest.raises(TimeoutError, match="pending"):
         updater._wait_for_pending_episodes()
-
-
-def test_explicit_graph_destruction_can_discard_a_stopped_failed_updater():
-    updater = SimpleNamespace(
-        graph_id="graph-1",
-        _running=False,
-        _worker_thread=SimpleNamespace(is_alive=lambda: False),
-    )
-    ZepGraphMemoryManager._updaters["sim-failed"] = updater
-    try:
-        assert ZepGraphMemoryManager.discard_inactive_updater("sim-failed") is True
-        assert "sim-failed" not in ZepGraphMemoryManager._updaters
-    finally:
-        ZepGraphMemoryManager._updaters.pop("sim-failed", None)
 
 
 def test_flush_deadline_keeps_unattempted_platform_for_a_safe_retry(monkeypatch):

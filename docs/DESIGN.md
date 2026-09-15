@@ -100,7 +100,8 @@ backend/
     models/                  # Project/ProjectManager, Task/TaskManager (in-memory)
     api/                     # graph.py, simulation.py, report.py (Flask blueprints)
     services/                # ontology, graph build, profiles, config gen, runner, report,
-                             # zep_tools, zep_entity_reader, zep_graph_memory_updater, ipc
+                             # zep_tools, zep_entity_reader, ipc, zep_graph_memory_updater
+                             # (last one: manual Cloud validation only, not wired to runs)
     utils/                   # llm_client, zep (+paging, lifecycle), json_files, locale,
                              # logger, file_parser, ontology, openai_chat_compat, retry
   scripts/                   # run_*_simulation.py (OASIS), action_logger.py, validators
@@ -183,7 +184,7 @@ stateDiagram-v2
     ready --> running: POST /api/simulation/start
     running --> stopping: POST /api/simulation/stop
     stopping --> stopped
-    running --> completed: process exits + ingestion drained
+    running --> completed: process exits + final log tail read
     running --> failed
     stopped --> running: restart (force or prepared check)
     completed --> running: restart
@@ -199,7 +200,7 @@ stateDiagram-v2
     idle --> starting: spawn process
     starting --> running: monitor thread up
     running --> stopping: stop requested
-    running --> completed: exit 0, no manual stop, ingestion drained
+    running --> completed: exit 0, no manual stop, final log tail read
     running --> failed: monitor error or exit != 0
     stopping --> stopped
   }
@@ -258,9 +259,8 @@ These are load-bearing; keep them when extending the code.
 4. **Append-only logs are tailed by byte offset, complete lines only.**
    `SimulationRunner._read_action_log()` opens the log in binary mode, consumes only lines
    terminated by `\n`, and always advances the offset. A partially written trailing line is
-   left for the next poll. Per-line failures (bad JSON, unexpected type, updater rejection)
-   are logged and skipped — the offset must never rewind, because the Zep writes driven by
-   those records are not idempotent.
+   left for the next poll. Per-line failures (bad JSON, unexpected field type) are logged
+   and skipped — the offset must never rewind, otherwise that record would be replayed.
 5. **A monitor starts where the current run starts.** `_monitor_simulation()` initialises
    its offsets to the current size of each `actions.jsonl`, so restarting a simulation does
    not replay the previous run's actions into counts or into Zep.
@@ -270,12 +270,12 @@ These are load-bearing; keep them when extending the code.
    graph reset/delete refuses while readers or active simulations exist (`GraphInUseError`).
 7. **Per-simulation finalization barrier**
    (`SimulationRunner._finalization_lock`): manual stop and natural process exit can observe
-   the same exit; the lock serialises the terminal state write and the Zep ingestion drain
-   so exactly one path owns the final result.
-8. **Graph-memory ingestion fails closed.** `ZepGraphMemoryUpdater.stop()` joins the worker,
-   flushes the queue and buffers under a deadline, then raises if any batch failed — the
-   runner keeps the simulation registered as failed-but-retryable rather than pretending the
-   graph is complete.
+   the same exit; the lock serialises the terminal state write so exactly one path owns the
+   final result.
+8. **A simulation never writes back to its graph.** Nothing in the run path constructs a Zep
+   writer: there is no request field, no runner parameter and no registry for one. The only
+   graph mutation the product performs is the seed ingestion of Pipeline 1 (§8); report and
+   interview traffic against a live simulation is read-only with respect to the graph.
 9. **Progress objects are snapshots.** `TaskManager.get_task()` returns a copy; routes never
    iterate or serialise an object that a worker thread is mutating.
 
@@ -285,8 +285,6 @@ These are load-bearing; keep them when extending the code.
   equivalents are `state.json`, `run_state.json` and `progress.json`.
 * Per-process id-keyed lock maps (`_build_locks`, `_graph_locks`, `_finalization_locks`) —
   process-local and never pruned (see `CHANGELOG.md` → Known issues).
-* Graph-memory batches that failed (`_failed_batches`) are intentionally **not** retried:
-  `graph.add` has no idempotency key, so replay could duplicate extracted facts.
 
 ## 8. Pipeline 1 — seed → ontology → graph
 
@@ -370,11 +368,9 @@ flowchart TB
    and re-persists `run_state.json`.
 4. On `simulation_end`, `_check_all_platforms_completed()` is consulted, but the terminal
    status is only published in the `finally` block, under the finalization lock, after the
-   process exited and — if enabled — the graph memory updater drained.
-5. With `enable_graph_memory_update=true`, every action is pushed through
-   `ZepGraphMemoryManager` → `ZepGraphMemoryUpdater`, which batches 5 activities per platform
-   into one Zep episode (≤9 500 chars per payload, `created_at` from the last activity),
-   then polls the created episodes until processed. Failures are recorded and fail the drain.
+   process exited and the final action-log tail was read.
+5. Action records are only counted and served (`/run-status`, `/actions`, `/timeline`,
+   `/agent-stats`). They are never written back to the Zep graph (§7.2 invariant 8).
 
 Interviews (`/api/simulation/interview*`) run through the file IPC protocol:
 
@@ -467,7 +463,7 @@ route runs, and `/api/report` validates `report_id` in the manager.
 
 `app/config.py` loads `<repo root>/.env` (override) at import time. `Config.validate()`
 rejects a missing `LLM_API_KEY`/`ZEP_API_KEY` and an unsupported `ZEP_API_URL`
-(this integration is Cloud-only). See `.env.example`.
+(this integration is Cloud-only). See `../.env`.
 
 | Key | Default | Notes |
 | --- | --- | --- |
@@ -504,7 +500,6 @@ Other Config constants: `MAX_CONTENT_LENGTH = 50 MB`, allowed uploads
 | Zep read fails (transport/408/429/5xx) | retried with exponential backoff honouring `Retry-After` | transparent |
 | Zep write fails / ambiguous create | fail closed, never replayed (`_failed_batches`, `operation_id` diff) | operator re-runs with `force` after inspecting |
 | Simulation process exits non-zero | monitor records the last 2 000 chars of `simulation.log`, run state `failed` | `POST /start` with `force` (stops + cleans logs) |
-| Graph memory drain incomplete | `stop()` raises, updater stays registered | retry stop; report/interview of that graph is blocked meanwhile |
 | Report generation aborted by an unexpected value | section loop is bounded; failure marks the report `failed`, written sections are kept | regenerate |
 | Graph in use by a reader/simulation | `GraphInUseError` → `409`-style refusal | wait or stop the consumer |
 

@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Simulation activity write-back to Zep removed
+
+The simulation run path no longer writes agent activity into the Zep graph. This is a
+scope reduction, requested explicitly: a run is now purely local (actions are counted and
+served from the `actions.jsonl` logs), with no Cloud write cost and no ingestion barrier
+that can hold a run in `stopping`. The seed ingestion of the graph build (Pipeline 1) is
+unchanged — that remains the only graph write the product performs.
+
+- **`POST /api/simulation/start` no longer accepts `enable_graph_memory_update`**
+  (`backend/app/api/simulation.py`). The field is gone from the request contract instead of
+  being forced to `false`, so no client can ask for the behaviour; the response no longer
+  contains `graph_memory_update_enabled` or the conditional `graph_id`, and the endpoint no
+  longer takes the per-graph lifecycle lock, re-reads the project graph, or refuses while a
+  report is reading the graph.
+- **`SimulationRunner` lost the whole enable path** (`backend/app/services/simulation_runner.py`):
+  the `enable_graph_memory_update` / `graph_id` parameters, the `_graph_memory_enabled`
+  registry, the updater-creation branch, the `stopping` ingestion barrier in the monitor, the
+  updater drain on stop / failure / shutdown, and the per-action `graph_updater` hook in
+  `_read_action_log()`. `stop_simulation()` now waits on the monitor with a plain 30 s bound
+  (`_MONITOR_FINALIZATION_TIMEOUT_SECONDS`) instead of `ZEP_INGESTION_WAIT_TIMEOUT_SECONDS +
+  HTTP timeout + 5`, and `cleanup_all_simulations()` enumerates live processes and run states
+  only.
+- **`ZepGraphMemoryManager` deleted** (`backend/app/services/zep_graph_memory_updater.py`,
+  `services/__init__.py`). The per-simulation registry existed only to serve the run path.
+  `ZepGraphMemoryUpdater` / `AgentActivity` are retained for the manual Cloud validation
+  script (`backend/scripts/validate_zep_cloud_integration.py`) and their unit tests; the
+  module docstring now states that it is not wired into the application.
+- **Lifecycle guards trimmed to what still exists** (`backend/app/api/graph.py`,
+  `backend/app/api/report.py`): graph deletion/reset still refuses while a report reads the
+  graph or a simulation run is active (reader lease + `starting/running/paused/stopping` run
+  states), but the updater-recovery branch and the `ingestion_pending` response field are
+  gone. Report generation still returns `409` while a run is non-terminal — the message now
+  says the simulation is active rather than that graph ingestion is.
+- **Frontend** (`frontend/src/components/Step3Simulation.vue`,
+  `frontend/src/api/simulation.js`): the start payload no longer carries
+  `enable_graph_memory_update` and the "dynamic graph memory update enabled" log line is
+  removed. `locales/zh.json` / `locales/en.json` dropped `log(s).graphMemoryUpdateEnabled`
+  and `api.graphIdRequiredForMemory` (key parity preserved: 645 keys each).
+- **Tests**: six obsolete tests deleted (two updater-drain tests in
+  `test_zep_simulation_barrier.py`, the updater discard test in
+  `test_zep_graph_memory_updater.py`, one in `test_zep_graph_lifecycle.py`, and the two
+  ingestion-barrier report tests that the trimmed status guard supersedes), and the tests
+  that still describe a real guarantee were rewritten around it: a non-terminal run blocks a
+  report, the report reader lease blocks graph deletion, a non-terminal run still blocks a
+  project reset, and shutdown terminates the producer before the final tail read. Two tests
+  in `test_simulation_state_regressions.py` were added for the monitor's terminal-state write
+  (clean exit → `completed`, manual stop → `stopped`), which had no coverage and was briefly
+  broken by this refactor.
+
+Verification: backend suite 147 passed (1 pre-existing failure, see below); root suite 173
+passed, 2 skipped, same failure; `npm run build` exit 0 (691 modules, only the two
+pre-existing warnings); live HTTP smoke test confirmed `POST /api/simulation/start` no longer
+validates the removed field and no longer reports it. The one failure,
+`test_zep_timeout_policy_is_not_exposed_in_env_example`, is unrelated to this change: the
+tracked `.env.example` file has been deleted from the working tree (it is still present in
+git), and the test reads it from disk.
+
 Repository-wide defect review of `backend/app`, `backend/scripts`, `frontend/src`,
 `scripts/` and the test suites. Twenty-eight defects were fixed; every fix is
 covered by the automated suites (153 backend tests, 179 root tests) and a live
@@ -158,7 +215,7 @@ HTTP smoke test.
 - **Misclassified GitHub rate limit** (`scripts/fetch_star_count.py`). `403` was always
   reported as "request was denied", hiding core rate-limit exhaustion (GitHub does not
   use `429` for it); the `X-RateLimit-Remaining` header is now consulted.
-- **`.env.example` boost placeholders** (`.env.example`). Shipping non-empty
+- **`.env` boost placeholders** (`.env`). Shipping non-empty
   `LLM_BOOST_*` placeholders makes the code treat the boost LLM as configured, pointing
   Reddit runs at `your_base_url_here`; the block is commented out.
 
